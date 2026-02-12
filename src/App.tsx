@@ -133,7 +133,7 @@ function App() {
 
   const latestCliRef = useRef<CodexCliStatus | null>(null);
   const vaultUnlocked = vaultStatus?.ok ?? false;
-  const codexCliRunning = Boolean(codexCliStatus?.running);
+  const codexCliRunning = Boolean(codexCliStatus?.running ?? codexCliStatus?.is_running);
   const codexProcessCount = codexCliStatus?.process_count ?? diagnostics?.process_count ?? 0;
 
   const accountNameMap = useMemo(() => {
@@ -221,7 +221,14 @@ function App() {
     async (silent = true) => {
       try {
         const latest = await getCodexCliStatus();
-        const normalized = { ...latest, last_checked_at: latest.last_checked_at ?? new Date().toISOString() };
+        const normalized: CodexCliStatus = {
+          ...latest,
+          running: latest.running ?? latest.is_running ?? false,
+          last_checked_at:
+            latest.last_checked_at ??
+            latest.checked_at ??
+            new Date().toISOString(),
+        };
         const previous = latestCliRef.current;
 
         if (normalized.requires_user_input && !previous?.requires_user_input) {

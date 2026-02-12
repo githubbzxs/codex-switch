@@ -44,7 +44,7 @@ export function createAccountFromLogin(name: string, tags: string[]): Promise<Ac
 }
 
 export function createAccountFromAuthFile(name: string, tags: string[], authFilePath: string): Promise<Account> {
-  return invokeCommand("create_account_from_auth_file", { name, tags, authFilePath });
+  return invokeCommand("create_account_from_auth_file", { name, tags, path: authFilePath });
 }
 
 export function listAccounts(): Promise<Account[]> {
