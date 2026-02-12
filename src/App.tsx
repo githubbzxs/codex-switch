@@ -275,9 +275,10 @@ function App() {
       setNotice({ kind: "error", text: "请先解锁保险库，再执行登录添加" });
       return;
     }
-    const result = await runAction("import-account", () =>
-      createAccountFromLogin(importName.trim(), parseTags(importTags)),
-    );
+    const result = await runAction("import-account", async () => {
+      setNotice({ kind: "info", text: "正在打开 Codex 远程登录页面，请在浏览器完成登录后返回。" });
+      return createAccountFromLogin(importName.trim(), parseTags(importTags));
+    });
     if (!result) {
       return;
     }
@@ -526,7 +527,7 @@ function App() {
               />
             </label>
             <button type="submit" className="btn btn-primary" disabled={!vaultUnlocked || isActionLoading("import-account")}>
-              {isActionLoading("import-account") ? "登录处理中..." : "登录并添加"}
+              {isActionLoading("import-account") ? "等待远程网页登录..." : "登录并添加"}
             </button>
           </form>
 
@@ -638,6 +639,7 @@ function App() {
                     <p>最近刷新：{formatDateTime(snapshot?.created_at)}</p>
                     <p>数据来源：{snapshot?.source ?? "—"}</p>
                     <p>置信度：{snapshot?.confidence ?? "—"}</p>
+                    {snapshot?.reason ? <p className="quota-reason">原因：{snapshot.reason}</p> : null}
                     <p>标签：{item.account.tags.join("、") || "无"}</p>
                   </article>
                 );
