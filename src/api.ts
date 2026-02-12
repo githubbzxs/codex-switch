@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Account,
+  CodexCliStatus,
   QuotaDashboardItem,
   QuotaRefreshPolicyInput,
   QuotaSnapshot,
@@ -40,6 +41,10 @@ export function createAccountFromImport(name: string, tags: string[]): Promise<A
 
 export function createAccountFromLogin(name: string, tags: string[]): Promise<Account> {
   return invokeCommand("create_account_from_login", { name, tags });
+}
+
+export function createAccountFromAuthFile(name: string, tags: string[], authFilePath: string): Promise<Account> {
+  return invokeCommand("create_account_from_auth_file", { name, tags, authFilePath });
 }
 
 export function listAccounts(): Promise<Account[]> {
@@ -96,4 +101,8 @@ export function setQuotaRefreshPolicy(policy: QuotaRefreshPolicyInput): Promise<
 
 export function getRuntimeDiagnostics(): Promise<RuntimeDiagnostics> {
   return invokeCommand("get_runtime_diagnostics");
+}
+
+export function getCodexCliStatus(): Promise<CodexCliStatus> {
+  return invokeCommand("get_codex_cli_status");
 }

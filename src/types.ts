@@ -43,6 +43,18 @@ export interface RuntimeDiagnostics {
   process_count: number;
 }
 
+export interface CodexCliStatus {
+  running?: boolean;
+  process_count?: number;
+  last_checked_at?: string | null;
+  requires_user_input?: boolean;
+  prompt?: string | null;
+  current_action?: string | null;
+  last_event?: string | null;
+  last_event_message?: string | null;
+  status?: string | null;
+}
+
 export interface QuotaSnapshot {
   id: string;
   account_id: string;
