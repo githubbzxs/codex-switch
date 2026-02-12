@@ -9,7 +9,11 @@ const CODEX_CLIENT_VERSION: &str = "0.98.0";
 const CODEX_OPENAI_BETA: &str = "responses=experimental";
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.98.0 (Windows NT 10.0; x86_64) codex-switch";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-const API_ENDPOINTS: [(&str, &str); 4] = [
+const API_ENDPOINTS: [(&str, &str); 8] = [
+    ("https://chatgpt.com", "/backend-api/api/codex/usage"),
+    ("https://chatgpt.com", "/backend-api/wham/usage"),
+    ("https://chat.openai.com", "/backend-api/api/codex/usage"),
+    ("https://chat.openai.com", "/backend-api/wham/usage"),
     ("https://chatgpt.com", "/backend-api/codex/usage"),
     ("https://chatgpt.com", "/backend-api/usage"),
     ("https://chat.openai.com", "/backend-api/codex/usage"),
@@ -107,6 +111,10 @@ async fn probe_via_api(
         if !status.is_success() {
             last_reason = reason_from_http_status(status, &endpoint);
             continue;
+        }
+
+        if let Some(result) = extract_from_codex_headers(response.headers(), "api", &endpoint) {
+            return Ok(result);
         }
 
         let json = match response.json::<Value>().await {
@@ -300,6 +308,122 @@ fn build_client(timeout_ms: u64) -> Result<Client> {
         .context("初始化配额 HTTP 客户端失败")
 }
 
+fn extract_from_codex_headers(
+    headers: &header::HeaderMap,
+    source: &str,
+    endpoint: &str,
+) -> Option<QuotaProbeResult> {
+    const REMAINING_KEYS: &[&str] = &[
+        "x-codex-remaining",
+        "x-codex-remaining-quota",
+        "x-codex-usage-remaining",
+        "x-codex-quota-remaining",
+    ];
+    const USED_KEYS: &[&str] = &["x-codex-used", "x-codex-usage-used", "x-codex-consumed"];
+    const LIMIT_KEYS: &[&str] = &["x-codex-limit", "x-codex-usage-limit", "x-codex-total"];
+    const UNIT_KEYS: &[&str] = &["x-codex-unit", "x-codex-quota-unit", "x-codex-remaining-unit"];
+    const RESET_KEYS: &[&str] = &[
+        "x-codex-reset-at",
+        "x-codex-reset",
+        "x-codex-reset-ts",
+        "x-codex-reset-time",
+    ];
+    const STATE_KEYS: &[&str] = &["x-codex-state", "x-codex-quota-state", "x-codex-usage-state"];
+
+    let remaining = extract_header_number_by_keys(headers, REMAINING_KEYS).or_else(|| {
+        let used = extract_header_number_by_keys(headers, USED_KEYS)?;
+        let limit = extract_header_number_by_keys(headers, LIMIT_KEYS)?;
+        Some((limit - used).max(0.0))
+    });
+    let unit = extract_header_text_by_keys(headers, UNIT_KEYS);
+    let reset_at = extract_header_text_by_keys(headers, RESET_KEYS);
+    let state_from_header = extract_header_text_by_keys(headers, STATE_KEYS)
+        .as_deref()
+        .and_then(normalize_quota_state);
+
+    if let Some(value) = remaining {
+        return Some(QuotaProbeResult {
+            mode: "exact".to_string(),
+            remaining_value: Some(value),
+            remaining_unit: unit,
+            quota_state: state_from_header
+                .map(ToString::to_string)
+                .unwrap_or_else(|| state_from_value(value).to_string()),
+            reset_at,
+            source: source.to_string(),
+            confidence: 96,
+            reason: Some(format!("x_codex_headers@{endpoint}")),
+        });
+    }
+
+    if let Some(state) = state_from_header {
+        return Some(QuotaProbeResult {
+            mode: "state".to_string(),
+            remaining_value: None,
+            remaining_unit: unit,
+            quota_state: state.to_string(),
+            reset_at,
+            source: source.to_string(),
+            confidence: 80,
+            reason: Some(format!("x_codex_headers_state@{endpoint}")),
+        });
+    }
+
+    None
+}
+
+fn extract_header_text_by_keys(headers: &header::HeaderMap, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        headers
+            .get(*key)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+fn extract_header_number_by_keys(headers: &header::HeaderMap, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        let raw = headers
+            .get(*key)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)?;
+        parse_first_f64(raw)
+    })
+}
+
+fn parse_first_f64(text: &str) -> Option<f64> {
+    let regex = Regex::new(r"(-?[0-9]+(?:\.[0-9]+)?)").ok()?;
+    let capture = regex.captures(text)?;
+    capture.get(1)?.as_str().parse::<f64>().ok()
+}
+
+fn normalize_quota_state(raw: &str) -> Option<&'static str> {
+    let lower = raw.to_lowercase();
+    if lower.contains("exhaust")
+        || lower.contains("limit")
+        || lower.contains("deny")
+        || lower.contains("blocked")
+    {
+        Some("exhausted")
+    } else if lower.contains("near")
+        || lower.contains("warn")
+        || lower.contains("low")
+        || lower.contains("throttle")
+    {
+        Some("near_limit")
+    } else if lower.contains("ok")
+        || lower.contains("allow")
+        || lower.contains("available")
+        || lower.contains("active")
+    {
+        Some("available")
+    } else {
+        None
+    }
+}
+
 fn extract_exact_from_json(json: &Value, source: &str) -> Option<QuotaProbeResult> {
     let mut numeric_candidates: Vec<(String, f64)> = Vec::new();
     collect_numeric_candidates("", json, &mut numeric_candidates);
@@ -474,5 +598,65 @@ pub fn ensure_access_token(auth_json: &Value) -> Result<String> {
         .pointer("/tokens/access_token")
         .and_then(Value::as_str)
         .map(ToString::to_string)
-        .ok_or_else(|| anyhow!("该账户缺少 access_token，无法查询配额"))
+        .ok_or_else(|| anyhow!("该账号缺少 access_token，无法查询配额"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_from_codex_headers;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn parses_remaining_from_codex_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-remaining", HeaderValue::from_static("12.5"));
+        headers.insert("x-codex-unit", HeaderValue::from_static("requests"));
+
+        let result = extract_from_codex_headers(
+            &headers,
+            "api",
+            "https://chatgpt.com/backend-api/api/codex/usage",
+        )
+        .expect("should parse headers");
+
+        assert_eq!(result.mode, "exact");
+        assert_eq!(result.remaining_value, Some(12.5));
+        assert_eq!(result.remaining_unit.as_deref(), Some("requests"));
+        assert_eq!(result.quota_state, "available");
+    }
+
+    #[test]
+    fn computes_remaining_from_limit_minus_used_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-limit", HeaderValue::from_static("100"));
+        headers.insert("x-codex-used", HeaderValue::from_static("97"));
+
+        let result = extract_from_codex_headers(
+            &headers,
+            "api",
+            "https://chat.openai.com/backend-api/wham/usage",
+        )
+        .expect("should parse headers");
+
+        assert_eq!(result.mode, "exact");
+        assert_eq!(result.remaining_value, Some(3.0));
+        assert_eq!(result.quota_state, "near_limit");
+    }
+
+    #[test]
+    fn parses_state_only_from_codex_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-state", HeaderValue::from_static("exhausted"));
+
+        let result = extract_from_codex_headers(
+            &headers,
+            "api",
+            "https://chatgpt.com/backend-api/api/codex/usage",
+        )
+        .expect("should parse state headers");
+
+        assert_eq!(result.mode, "state");
+        assert_eq!(result.remaining_value, None);
+        assert_eq!(result.quota_state, "exhausted");
+    }
 }

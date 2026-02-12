@@ -8,8 +8,9 @@ mod store;
 use anyhow::Context;
 use app_state::AppState;
 use codex::{
-    atomic_write, codex_auth_path, compute_fingerprint, create_snapshot, kill_codex_processes,
-    read_and_validate_auth_json, restart_codex, run_codex_login, validate_auth_json,
+    atomic_write, codex_auth_path, compute_fingerprint, count_codex_processes, create_snapshot,
+    kill_codex_processes, read_and_validate_auth_json, restart_codex, run_codex_login,
+    validate_auth_json,
 };
 use models::{
     Account, CodexCliStatus, QuotaDashboardItem, QuotaRefreshPolicy, QuotaSnapshot,
@@ -588,28 +589,6 @@ fn get_codex_cli_status() -> CmdResult<CodexCliStatus> {
             checked_at: chrono::Utc::now().to_rfc3339(),
         })
     })())
-}
-
-fn count_codex_processes() -> usize {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
-    let refresh = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
-    let mut system = System::new_with_specifics(refresh);
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    system
-        .processes()
-        .values()
-        .filter(|process| {
-            let name = process.name().to_string_lossy().to_lowercase();
-            let cmdline = process
-                .cmd()
-                .iter()
-                .map(|part| part.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase();
-            name.contains("codex") || cmdline.contains("codex")
-        })
-        .count()
 }
 
 fn state_rank(state: Option<&str>) -> u8 {
