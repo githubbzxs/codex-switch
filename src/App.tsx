@@ -1,4 +1,5 @@
-﻿import { open } from "@tauri-apps/plugin-dialog";
+﻿
+import { open } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -23,6 +24,7 @@ import type {
   Account,
   AccountDraft,
   CodexCliStatus,
+  QuotaDashboardItem,
   QuotaSnapshot,
   RuntimeDiagnostics,
   SimpleStatus,
@@ -33,15 +35,63 @@ import "./App.css";
 
 const HISTORY_LIMIT = 30;
 const CLI_STATUS_POLL_MS = 6000;
+const ACTIVITY_LIMIT = 20;
 
-type WorkspaceView = "dashboard" | "accounts" | "quota" | "history";
+type WorkspaceView = "overview" | "vault" | "accounts" | "quota" | "history" | "diagnostics";
+type ActivityLevel = UiNotice["kind"];
+type NoticeMode = "none" | "fallback" | "always";
 
-const navItems: Array<{ id: WorkspaceView; label: string; hint: string }> = [
-  { id: "dashboard", label: "工作台", hint: "总览状态与关键指标" },
-  { id: "accounts", label: "账号管理", hint: "添加、编辑、切换账号" },
-  { id: "quota", label: "配额中心", hint: "查询和刷新配额状态" },
-  { id: "history", label: "切换历史", hint: "回滚与审计记录" },
+interface NavItem {
+  id: WorkspaceView;
+  label: string;
+  hint: string;
+}
+
+interface NavGroup {
+  title: string;
+  items: NavItem[];
+}
+
+interface ActivityItem {
+  id: string;
+  level: ActivityLevel;
+  title: string;
+  detail: string;
+  created_at: string;
+}
+
+interface RunActionOptions {
+  suppressNotice?: boolean;
+  onError?: (message: string) => void;
+}
+
+const navGroups: NavGroup[] = [
+  {
+    title: "核心工作区",
+    items: [
+      { id: "overview", label: "概览", hint: "全局指标与快捷入口" },
+      { id: "accounts", label: "账号", hint: "登录导入、编辑与切换" },
+      { id: "quota", label: "配额", hint: "刷新与状态追踪" },
+      { id: "history", label: "历史", hint: "回滚与审计记录" },
+    ],
+  },
+  {
+    title: "系统管理",
+    items: [
+      { id: "vault", label: "保险库", hint: "主密码与加密状态" },
+      { id: "diagnostics", label: "诊断", hint: "运行环境与路径检查" },
+    ],
+  },
 ];
+
+const viewMeta: Record<WorkspaceView, { title: string; description: string }> = {
+  overview: { title: "全局概览", description: "快速掌握账号规模、配额状态与最新切换结果。" },
+  vault: { title: "保险库控制", description: "初始化、解锁与锁定主保险库，保护账号密文。" },
+  accounts: { title: "账号管理", description: "通过登录或认证文件新增账号，并维护标签和元数据。" },
+  quota: { title: "配额中心", description: "按账号刷新配额，查看来源、置信度与异常原因。" },
+  history: { title: "切换历史", description: "审计每次切换结果，可按记录执行回滚。" },
+  diagnostics: { title: "运行诊断", description: "检查认证文件、数据库路径和 Codex 进程状态。" },
+};
 
 const quotaStateText: Record<string, string> = {
   available: "配额充足",
@@ -101,25 +151,16 @@ function buildDraft(account: Account): AccountDraft {
   return { name: account.name, tagsText: account.tags.join(", ") };
 }
 
-function isCompletionStatus(status: CodexCliStatus): boolean {
-  const text = [status.last_event, status.status, status.current_action, status.last_event_message]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  return ["completed", "done", "finished", "success", "failed", "error", "完成", "成功", "失败"].some((k) =>
-    text.includes(k),
-  );
-}
-
 function App() {
-  const [activeView, setActiveView] = useState<WorkspaceView>("dashboard");
+  const [activeView, setActiveView] = useState<WorkspaceView>("overview");
   const [vaultStatus, setVaultStatus] = useState<SimpleStatus | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [quotaDashboard, setQuotaDashboard] = useState<Array<{ account: Account; snapshot: QuotaSnapshot | null }>>([]);
+  const [quotaDashboard, setQuotaDashboard] = useState<QuotaDashboardItem[]>([]);
   const [historyItems, setHistoryItems] = useState<SwitchHistory[]>([]);
   const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics | null>(null);
   const [codexCliStatus, setCodexCliStatus] = useState<CodexCliStatus | null>(null);
   const [notice, setNotice] = useState<UiNotice | null>(null);
+  const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
 
   const [masterPassword, setMasterPassword] = useState("");
   const [newAccountName, setNewAccountName] = useState("");
@@ -132,9 +173,11 @@ function App() {
   const [actionLoading, setActionLoading] = useState<Record<string, boolean>>({});
 
   const latestCliRef = useRef<CodexCliStatus | null>(null);
+
   const vaultUnlocked = vaultStatus?.ok ?? false;
-  const codexCliRunning = Boolean(codexCliStatus?.running ?? codexCliStatus?.is_running);
+  const codexCliRunning = Boolean(codexCliStatus?.is_running);
   const codexProcessCount = codexCliStatus?.process_count ?? diagnostics?.process_count ?? 0;
+  const busyActionCount = useMemo(() => Object.values(actionLoading).filter(Boolean).length, [actionLoading]);
 
   const accountNameMap = useMemo(() => {
     const map = new Map<string, string>();
@@ -162,35 +205,64 @@ function App() {
 
   const isActionLoading = useCallback((key: string) => Boolean(actionLoading[key]), [actionLoading]);
 
-  const notifySystem = useCallback(async (title: string, body: string) => {
+  const appendActivity = useCallback((level: ActivityLevel, title: string, detail: string) => {
+    setActivityItems((previous) => {
+      const next: ActivityItem = {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        level,
+        title,
+        detail,
+        created_at: new Date().toISOString(),
+      };
+      return [next, ...previous].slice(0, ACTIVITY_LIMIT);
+    });
+  }, []);
+
+  const notifySystem = useCallback(async (title: string, body: string): Promise<boolean> => {
     try {
       let granted = await isPermissionGranted();
       if (!granted) {
         const permission = await requestPermission();
         granted = permission === "granted";
       }
-      if (granted) await sendNotification({ title, body });
+      if (!granted) return false;
+      await sendNotification({ title, body });
+      return true;
     } catch (error) {
       console.warn("发送系统通知失败", error);
+      return false;
     }
   }, []);
 
+  const emitEvent = useCallback(
+    async (title: string, detail: string, level: ActivityLevel = "info", noticeMode: NoticeMode = "fallback") => {
+      appendActivity(level, title, detail);
+      const delivered = await notifySystem(title, detail);
+      if (noticeMode === "always" || (noticeMode === "fallback" && !delivered)) {
+        setNotice({ kind: level, text: `${title}：${detail}` });
+      }
+    },
+    [appendActivity, notifySystem],
+  );
+
   const runAction = useCallback(
-    async <T,>(key: string, action: () => Promise<T>): Promise<T | null> => {
+    async <T,>(key: string, action: () => Promise<T>, options?: RunActionOptions): Promise<T | null> => {
       setActionLoading((prev) => ({ ...prev, [key]: true }));
       setNotice(null);
       try {
         return await action();
       } catch (error) {
         const message = normalizeError(error);
-        setNotice({ kind: "error", text: message });
-        void notifySystem("操作失败", message);
+        if (!options?.suppressNotice) {
+          setNotice({ kind: "error", text: message });
+        }
+        options?.onError?.(message);
         return null;
       } finally {
         setActionLoading((prev) => ({ ...prev, [key]: false }));
       }
     },
-    [notifySystem],
+    [],
   );
 
   const refreshAllData = useCallback(async (showLoading = false): Promise<boolean> => {
@@ -222,44 +294,29 @@ function App() {
       try {
         const latest = await getCodexCliStatus();
         const normalized: CodexCliStatus = {
-          ...latest,
-          running: latest.running ?? latest.is_running ?? false,
-          last_checked_at:
-            latest.last_checked_at ??
-            latest.checked_at ??
-            new Date().toISOString(),
+          is_running: Boolean(latest.is_running),
+          process_count: latest.process_count ?? 0,
+          checked_at: latest.checked_at ?? new Date().toISOString(),
         };
+
         const previous = latestCliRef.current;
-        const previousRunning = Boolean(previous?.running ?? previous?.is_running);
-        const nextRunning = Boolean(normalized.running ?? normalized.is_running);
-
-        if (previous) {
-          if (!previousRunning && nextRunning) {
-            void notifySystem("Codex CLI 已启动", "检测到 Codex CLI 进程启动，如需输入请在终端或浏览器完成。");
-          } else if (previousRunning && !nextRunning) {
-            void notifySystem("Codex CLI 已结束", "检测到 Codex CLI 进程结束，相关操作可能已完成。");
+        if (previous && Boolean(previous.is_running) !== Boolean(normalized.is_running)) {
+          if (normalized.is_running) {
+            void emitEvent("Codex CLI 已启动", `检测到 ${normalized.process_count ?? 0} 个相关进程。`, "info", "fallback");
+          } else {
+            void emitEvent("Codex CLI 已停止", "检测到 Codex CLI 进程结束。", "info", "fallback");
           }
-        }
-
-        if (normalized.requires_user_input && !previous?.requires_user_input) {
-          const prompt = normalized.prompt ?? normalized.last_event_message ?? "请切回终端或浏览器完成输入。";
-          void notifySystem("Codex CLI 需要用户输入", prompt);
-        }
-
-        const prevEvent = `${previous?.last_event ?? ""}|${previous?.last_event_message ?? ""}`;
-        const nextEvent = `${normalized.last_event ?? ""}|${normalized.last_event_message ?? ""}`;
-        if (prevEvent !== nextEvent && isCompletionStatus(normalized)) {
-          const message = normalized.last_event_message ?? normalized.last_event ?? normalized.status ?? "Codex CLI 状态已更新";
-          void notifySystem("Codex CLI 操作完成", message);
         }
 
         latestCliRef.current = normalized;
         setCodexCliStatus(normalized);
       } catch (error) {
-        if (!silent) setNotice({ kind: "error", text: `获取 Codex CLI 状态失败：${normalizeError(error)}` });
+        if (!silent) {
+          setNotice({ kind: "error", text: `获取 Codex CLI 状态失败：${normalizeError(error)}` });
+        }
       }
     },
-    [notifySystem],
+    [emitEvent],
   );
 
   useEffect(() => {
@@ -307,11 +364,10 @@ function App() {
       setAuthFilePath(pickedPath);
       setNotice({ kind: "info", text: `已选择认证文件：${pickedPath}` });
     } catch (error) {
-      const message = `选择认证文件失败：${normalizeError(error)}`;
-      setNotice({ kind: "error", text: message });
-      void notifySystem("操作失败", message);
+      setNotice({ kind: "error", text: `选择认证文件失败：${normalizeError(error)}` });
     }
   };
+
   const handleInitVault = async () => {
     if (masterPassword.trim().length < 8) {
       setNotice({ kind: "error", text: "初始化保险库至少需要 8 位主密码" });
@@ -320,7 +376,6 @@ function App() {
     const result = await runAction("init-vault", () => initVault(masterPassword.trim()));
     if (!result) return;
     setNotice({ kind: result.ok ? "success" : "info", text: result.message });
-    void notifySystem(result.ok ? "操作完成" : "操作提醒", result.message);
     if (result.ok) setMasterPassword("");
     await refreshAllData();
   };
@@ -333,7 +388,6 @@ function App() {
     const result = await runAction("unlock-vault", () => unlockVault(masterPassword.trim()));
     if (!result) return;
     setNotice({ kind: result.ok ? "success" : "info", text: result.message });
-    void notifySystem(result.ok ? "操作完成" : "操作提醒", result.message);
     if (result.ok) setMasterPassword("");
     await refreshAllData();
   };
@@ -342,7 +396,6 @@ function App() {
     const result = await runAction("lock-vault", lockVault);
     if (!result) return;
     setNotice({ kind: result.ok ? "success" : "info", text: result.message });
-    void notifySystem(result.ok ? "操作完成" : "操作提醒", result.message);
     await refreshAllData();
   };
 
@@ -351,7 +404,6 @@ function App() {
     if (!result) return;
     setDiagnostics(result);
     setNotice({ kind: "success", text: "运行诊断已刷新" });
-    void notifySystem("操作完成", "运行诊断已刷新");
   };
 
   const handleImportAccountByLogin = async () => {
@@ -359,14 +411,22 @@ function App() {
       setNotice({ kind: "error", text: "请先解锁保险库，再执行登录添加" });
       return;
     }
-    setNotice({ kind: "info", text: "正在启动 Codex 登录，请在浏览器完成认证后返回应用。" });
-    void notifySystem("Codex CLI 需要用户输入", "已启动登录流程，请在浏览器完成授权后返回应用。" );
-    const result = await runAction("import-account-login", () =>
-      createAccountFromLogin(newAccountName.trim(), parseTags(newAccountTags)),
+
+    void emitEvent("登录流程已启动", "已调用 Codex 登录，请在浏览器完成授权后返回应用。", "info", "always");
+
+    const result = await runAction(
+      "import-account-login",
+      () => createAccountFromLogin(newAccountName.trim(), parseTags(newAccountTags)),
+      {
+        suppressNotice: true,
+        onError: (message) => {
+          void emitEvent("登录并添加失败", message, "error", "always");
+        },
+      },
     );
     if (!result) return;
-    setNotice({ kind: "success", text: `登录并添加成功：${result.name}` });
-    void notifySystem("操作完成", `登录并添加成功：${result.name}`);
+
+    void emitEvent("登录并添加成功", `账号 ${result.name} 已保存到保险库。`, "success", "always");
     clearCreateFields();
     await refreshAllData();
     await refreshCodexCliStatus(false);
@@ -386,7 +446,6 @@ function App() {
     );
     if (!result) return;
     setNotice({ kind: "success", text: `导入认证文件成功：${result.name}` });
-    void notifySystem("操作完成", `导入认证文件成功：${result.name}`);
     clearCreateFields();
     await refreshAllData();
     await refreshCodexCliStatus(false);
@@ -413,7 +472,6 @@ function App() {
     );
     if (!result) return;
     setNotice({ kind: result.ok ? "success" : "info", text: result.message });
-    void notifySystem(result.ok ? "操作完成" : "操作提醒", result.message);
     await refreshAllData();
   };
 
@@ -423,7 +481,6 @@ function App() {
     const result = await runAction(`delete-${account.id}`, () => deleteAccount(account.id));
     if (!result) return;
     setNotice({ kind: result.ok ? "success" : "info", text: result.message });
-    void notifySystem(result.ok ? "操作完成" : "操作提醒", result.message);
     await refreshAllData();
   };
 
@@ -432,10 +489,19 @@ function App() {
       setNotice({ kind: "error", text: "请先解锁保险库，再切换账号" });
       return;
     }
-    const result = await runAction(actionKey, () => switchAccount(accountId, forceRestart));
+    const accountName = resolveAccountName(accountId);
+    const result = await runAction(actionKey, () => switchAccount(accountId, forceRestart), {
+      suppressNotice: true,
+      onError: (message) => {
+        void emitEvent("账号切换失败", `${accountName}：${message}`, "error", "always");
+      },
+    });
     if (!result) return;
-    setNotice({ kind: result.success ? "success" : "error", text: result.message });
-    void notifySystem(result.success ? "切换完成" : "切换失败", result.message);
+
+    const level: ActivityLevel = result.success ? "success" : "error";
+    const title = result.success ? "账号切换成功" : "账号切换失败";
+    void emitEvent(title, `${accountName}：${result.message}`, level, "always");
+
     await refreshAllData();
     await refreshCodexCliStatus(false);
   };
@@ -458,12 +524,17 @@ function App() {
       setNotice({ kind: "error", text: "请先解锁保险库，再刷新配额" });
       return;
     }
-    const result = await runAction(actionKey, () => refreshQuota(accountId, true));
+    const scopeLabel = accountId ? `账号 ${resolveAccountName(accountId)}` : "全部账号";
+    const result = await runAction(actionKey, () => refreshQuota(accountId, true), {
+      suppressNotice: true,
+      onError: (message) => {
+        void emitEvent("配额刷新失败", `${scopeLabel}：${message}`, "error", "always");
+      },
+    });
     if (!result) return;
-    const scope = accountId ? "所选账号" : "全部账号";
-    const message = `已刷新${scope}配额，共 ${result.length} 条记录`;
-    setNotice({ kind: "success", text: message });
-    void notifySystem("配额刷新完成", message);
+
+    const message = `已刷新${scopeLabel}，共 ${result.length} 条记录。`;
+    void emitEvent("配额刷新完成", message, "success", "always");
     await refreshAllData();
   };
 
@@ -493,33 +564,20 @@ function App() {
     const result = await runAction(`rollback-${item.id}`, () => rollbackToHistory(item.id));
     if (!result) return;
     setNotice({ kind: result.success ? "success" : "error", text: result.message });
-    void notifySystem(result.success ? "回滚完成" : "回滚失败", result.message);
     await refreshAllData();
   };
 
   const handleReloadAll = async () => {
     const ok = await refreshAllData(true);
     await refreshCodexCliStatus(false);
-    if (ok) {
-      setNotice({ kind: "success", text: "页面数据已刷新" });
-      void notifySystem("操作完成", "页面数据已刷新");
-    }
+    if (ok) setNotice({ kind: "success", text: "页面数据已刷新" });
   };
-  const dashboardView = (
-    <div className="workspace-stack">
-      <section className="workspace-card">
-        <h2 className="section-title">全局概览</h2>
-        <div className="metric-grid">
-          <article className="metric-card"><span>账号总数</span><strong>{stats.accountCount}</strong></article>
-          <article className="metric-card"><span>配额充足</span><strong>{stats.availableQuotaCount}</strong></article>
-          <article className="metric-card"><span>需关注配额</span><strong>{stats.warningQuotaCount}</strong></article>
-          <article className="metric-card"><span>最近历史条数</span><strong>{stats.historyCount}</strong></article>
-        </div>
-      </section>
 
-      <section className="workspace-card">
-        <div className="section-header">
-          <h2 className="section-title">近期配额状态</h2>
+  const overviewView = (
+    <div className="view-stack">
+      <section className="view-card">
+        <div className="card-head">
+          <h3>运行总览</h3>
           <button
             type="button"
             className="btn btn-secondary"
@@ -528,6 +586,41 @@ function App() {
           >
             {isActionLoading("refresh-quota-all") ? "刷新中..." : "刷新全部配额"}
           </button>
+        </div>
+        <div className="metric-grid">
+          <article className="metric-tile"><span>账号总数</span><strong>{stats.accountCount}</strong></article>
+          <article className="metric-tile"><span>配额充足</span><strong>{stats.availableQuotaCount}</strong></article>
+          <article className="metric-tile"><span>需关注配额</span><strong>{stats.warningQuotaCount}</strong></article>
+          <article className="metric-tile"><span>历史记录</span><strong>{stats.historyCount}</strong></article>
+        </div>
+      </section>
+
+      <section className="view-card">
+        <div className="card-head"><h3>快捷入口</h3></div>
+        <div className="shortcut-grid">
+          <button type="button" className="shortcut-tile" onClick={() => setActiveView("accounts")}>
+            <span>账号管理</span>
+            <small>新增账号、编辑标签并执行行内切换。</small>
+          </button>
+          <button type="button" className="shortcut-tile" onClick={() => setActiveView("quota")}>
+            <span>配额中心</span>
+            <small>按账号刷新配额，聚焦异常原因与置信度。</small>
+          </button>
+          <button type="button" className="shortcut-tile" onClick={() => setActiveView("history")}>
+            <span>切换历史</span>
+            <small>回看操作链路，必要时快速执行回滚。</small>
+          </button>
+          <button type="button" className="shortcut-tile" onClick={() => setActiveView("diagnostics")}>
+            <span>运行诊断</span>
+            <small>检查认证路径、数据库与进程健康。</small>
+          </button>
+        </div>
+      </section>
+
+      <section className="view-card">
+        <div className="card-head">
+          <h3>近期配额状态</h3>
+          <button type="button" className="btn btn-ghost" onClick={() => setActiveView("quota")}>查看全部</button>
         </div>
         {quotaDashboard.length === 0 ? (
           <div className="empty-block">暂无配额数据，请先执行刷新。</div>
@@ -539,7 +632,7 @@ function App() {
               return (
                 <article className="quota-card" key={item.account.id}>
                   <header>
-                    <h3>{item.account.name}</h3>
+                    <h4>{item.account.name}</h4>
                     <span className={`state-pill ${quotaStateClassName(state)}`}>
                       {quotaStateText[state] ?? quotaStateText.unknown}
                     </span>
@@ -553,13 +646,79 @@ function App() {
           </div>
         )}
       </section>
+
+      <section className="view-card">
+        <div className="card-head">
+          <h3>最近切换</h3>
+          <button type="button" className="btn btn-ghost" onClick={() => setActiveView("history")}>进入历史</button>
+        </div>
+        {historyItems.length === 0 ? (
+          <div className="empty-block">暂无切换历史。</div>
+        ) : (
+          <div className="history-stream">
+            {historyItems.slice(0, 6).map((item) => (
+              <article key={item.id} className="history-stream-item">
+                <div>
+                  <strong>{resolveAccountName(item.to_account_id)}</strong>
+                  <p>{formatDateTime(item.created_at)}</p>
+                </div>
+                <span className={`history-pill ${historyResultClassName(item.result)}`}>
+                  {historyResultText[item.result] ?? item.result}
+                </span>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+
+  const vaultView = (
+    <div className="view-stack">
+      <section className="view-card">
+        <div className="card-head">
+          <h3>保险库状态</h3>
+          <span className={`status-badge ${vaultUnlocked ? "ok" : "warn"}`}>{vaultUnlocked ? "已解锁" : "未解锁"}</span>
+        </div>
+        <label className="field-label">
+          主密码
+          <input
+            type="password"
+            value={masterPassword}
+            onChange={(event) => setMasterPassword(event.currentTarget.value)}
+            placeholder="输入主密码"
+            autoComplete="off"
+          />
+        </label>
+        <div className="button-row">
+          <button type="button" className="btn btn-primary" onClick={handleInitVault} disabled={isActionLoading("init-vault")}>
+            {isActionLoading("init-vault") ? "初始化中..." : "初始化"}
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={handleUnlockVault} disabled={isActionLoading("unlock-vault")}>
+            {isActionLoading("unlock-vault") ? "解锁中..." : "解锁"}
+          </button>
+          <button type="button" className="btn btn-secondary" onClick={handleLockVault} disabled={isActionLoading("lock-vault")}>
+            {isActionLoading("lock-vault") ? "锁定中..." : "锁定"}
+          </button>
+        </div>
+        <p className="muted-text">状态说明：{vaultStatus?.message ?? "正在读取保险库状态..."}</p>
+      </section>
+
+      <section className="view-card">
+        <h3>操作建议</h3>
+        <div className="tips-list">
+          <p>1. 主密码建议至少 12 位，并混合大小写、数字与符号。</p>
+          <p>2. 切换高频场景建议开启“强制重启 Codex 进程”以减少残留状态。</p>
+          <p>3. 执行登录并添加前，请确认浏览器可正常访问授权页面。</p>
+        </div>
+      </section>
     </div>
   );
 
   const accountsView = (
-    <div className="workspace-stack">
-      <section className="workspace-card">
-        <h2 className="section-title">新增账号</h2>
+    <div className="view-stack">
+      <section className="view-card">
+        <div className="card-head"><h3>新增账号</h3></div>
         <div className="form-grid">
           <label className="field-label">
             账号名称
@@ -607,8 +766,8 @@ function App() {
         </div>
       </section>
 
-      <section className="workspace-card">
-        <h2 className="section-title">账号列表</h2>
+      <section className="view-card">
+        <div className="card-head"><h3>账号列表</h3></div>
         <div className="table-wrap">
           <table className="data-table">
             <thead>
@@ -622,7 +781,7 @@ function App() {
             </thead>
             <tbody>
               {accounts.length === 0 && (
-                <tr><td className="empty-cell" colSpan={5}>暂无账号，请先执行“登录并添加”或“导入认证文件”。</td></tr>
+                <tr><td className="empty-cell" colSpan={5}>暂无账号，请先执行登录或导入。</td></tr>
               )}
               {accounts.map((account) => {
                 const draft = accountDrafts[account.id] ?? buildDraft(account);
@@ -661,18 +820,17 @@ function App() {
       </section>
     </div>
   );
+
   const quotaView = (
-    <div className="workspace-stack">
-      <section className="workspace-card">
-        <h2 className="section-title">配额查询</h2>
+    <div className="view-stack">
+      <section className="view-card">
+        <div className="card-head"><h3>配额查询</h3></div>
         <div className="operation-grid">
           <label className="field-label">
             目标账号
             <select value={selectedAccountId} onChange={(event) => setSelectedAccountId(event.currentTarget.value)}>
               {accounts.length === 0 && <option value="">暂无可选账号</option>}
-              {accounts.map((account) => (
-                <option key={account.id} value={account.id}>{account.name}</option>
-              ))}
+              {accounts.map((account) => (<option key={account.id} value={account.id}>{account.name}</option>))}
             </select>
           </label>
           <div className="button-row">
@@ -696,7 +854,7 @@ function App() {
         </div>
       </section>
 
-      <section className="workspace-card">
+      <section className="view-card">
         {quotaDashboard.length === 0 ? (
           <div className="empty-block">暂无配额数据，请先点击刷新。</div>
         ) : (
@@ -707,7 +865,7 @@ function App() {
               return (
                 <article className="quota-card" key={item.account.id}>
                   <header>
-                    <h3>{item.account.name}</h3>
+                    <h4>{item.account.name}</h4>
                     <span className={`state-pill ${quotaStateClassName(state)}`}>
                       {quotaStateText[state] ?? quotaStateText.unknown}
                     </span>
@@ -728,11 +886,11 @@ function App() {
   );
 
   const historyView = (
-    <div className="workspace-stack">
-      <section className="workspace-card">
-        <h2 className="section-title">切换历史</h2>
+    <div className="view-stack">
+      <section className="view-card">
+        <div className="card-head"><h3>切换历史</h3></div>
         <div className="table-wrap">
-          <table className="data-table history-table">
+          <table className="data-table">
             <thead>
               <tr>
                 <th>时间</th>
@@ -770,79 +928,122 @@ function App() {
     </div>
   );
 
+  const diagnosticsView = (
+    <div className="view-stack">
+      <section className="view-card">
+        <div className="card-head">
+          <h3>运行诊断</h3>
+          <button type="button" className="btn btn-ghost" onClick={handleRefreshDiagnostics} disabled={isActionLoading("refresh-diagnostics")}>
+            {isActionLoading("refresh-diagnostics") ? "刷新中..." : "刷新"}
+          </button>
+        </div>
+        {diagnostics ? (
+          <>
+            <div className="diagnostic-grid">
+              <article className="diagnostic-tile"><span>认证文件</span><strong>{diagnostics.codex_auth_exists ? "存在" : "缺失"}</strong></article>
+              <article className="diagnostic-tile"><span>结构校验</span><strong>{diagnostics.schema_ok ? "正常" : "异常"}</strong></article>
+              <article className="diagnostic-tile"><span>进程数量</span><strong>{diagnostics.process_count}</strong></article>
+            </div>
+            <div className="path-grid">
+              <div><span>认证路径</span><code>{diagnostics.codex_auth_path}</code></div>
+              <div><span>数据库路径</span><code>{diagnostics.db_path}</code></div>
+              <div><span>应用数据目录</span><code>{diagnostics.app_data_dir}</code></div>
+            </div>
+          </>
+        ) : (
+          <p className="muted-text">暂无诊断数据</p>
+        )}
+      </section>
+    </div>
+  );
+
   const workspaceContent =
-    activeView === "accounts" ? accountsView : activeView === "quota" ? quotaView : activeView === "history" ? historyView : dashboardView;
+    activeView === "vault"
+      ? vaultView
+      : activeView === "accounts"
+      ? accountsView
+      : activeView === "quota"
+      ? quotaView
+      : activeView === "history"
+      ? historyView
+      : activeView === "diagnostics"
+      ? diagnosticsView
+      : overviewView;
+
+  const selectedAccountName = selectedAccountId ? resolveAccountName(selectedAccountId) : "未选择账号";
 
   return (
-    <div className="desktop-shell">
-      <aside className="sidebar">
-        <div className="brand-card">
-          <p className="brand-kicker">Codex Switch</p>
-          <h1>桌面控制台</h1>
-          <p>多账号切换、配额查询与登录监控的一体化工作台。</p>
+    <div className="console-shell">
+      <aside className="nav-sidebar">
+        <div className="brand-box">
+          <span className="brand-tag">Codex Switch</span>
+          <h1>控制台</h1>
+          <p>多账号切换、配额追踪、登录链路监控。</p>
         </div>
 
-        <nav className="nav-list" aria-label="主导航">
-          {navItems.map((item) => (
-            <button type="button" key={item.id} className={`nav-item ${activeView === item.id ? "active" : ""}`} onClick={() => setActiveView(item.id)}>
-              <span>{item.label}</span>
-              <small>{item.hint}</small>
-            </button>
+        <div className="nav-sections">
+          {navGroups.map((group) => (
+            <section className="nav-group" key={group.title}>
+              <h2>{group.title}</h2>
+              <div className="nav-items">
+                {group.items.map((item) => (
+                  <button
+                    type="button"
+                    key={item.id}
+                    className={`nav-item ${activeView === item.id ? "active" : ""}`}
+                    onClick={() => setActiveView(item.id)}
+                  >
+                    <span>{item.label}</span>
+                    <small>{item.hint}</small>
+                  </button>
+                ))}
+              </div>
+            </section>
           ))}
-        </nav>
+        </div>
 
-        <div className="sidebar-footnote">
-          <div className={`status-chip ${vaultUnlocked ? "ok" : "warn"}`}>保险库：{vaultUnlocked ? "已解锁" : "未解锁"}</div>
-          <div className={`status-chip ${codexCliRunning ? "ok" : "idle"}`}>Codex CLI：{codexCliRunning ? "运行中" : "未运行"}</div>
+        <div className="status-stack">
+          <div className={`status-badge ${vaultUnlocked ? "ok" : "warn"}`}>保险库：{vaultUnlocked ? "已解锁" : "未解锁"}</div>
+          <div className={`status-badge ${codexCliRunning ? "ok" : "idle"}`}>CLI：{codexCliRunning ? "运行中" : "未运行"}</div>
+          <div className="status-badge idle">活动任务：{busyActionCount}</div>
         </div>
       </aside>
 
-      <main className="workspace-shell">
-        <header className="workspace-topbar">
+      <main className="main-region">
+        <header className="main-header">
           <div>
-            <h2>{navItems.find((item) => item.id === activeView)?.label ?? "工作台"}</h2>
-            <p>当前运行进程：{codexProcessCount}，最近检测：{formatDateTime(codexCliStatus?.last_checked_at)}</p>
+            <h2>{viewMeta[activeView].title}</h2>
+            <p>{viewMeta[activeView].description}</p>
           </div>
-          <div className="topbar-actions">
+          <div className="header-actions">
             <button type="button" className="btn btn-secondary" onClick={() => void refreshCodexCliStatus(false)}>刷新 CLI 状态</button>
             <button type="button" className="btn btn-primary" onClick={handleReloadAll} disabled={loadingPage}>刷新全部数据</button>
           </div>
         </header>
 
-        {notice && <div className={`notice notice-${notice.kind}`}>{notice.text}</div>}
+        <div className="header-subline">
+          <span>CLI 进程：{codexProcessCount}</span>
+          <span>最近检测：{formatDateTime(codexCliStatus?.checked_at)}</span>
+        </div>
 
-        <section className="workspace-body">{workspaceContent}</section>
+        {notice && <div className={`inline-notice notice-${notice.kind}`}>{notice.text}</div>}
+
+        <section className="content-region">{workspaceContent}</section>
       </main>
 
-      <aside className="status-panel">
+      <aside className="activity-sidebar">
         <section className="panel-card">
-          <div className="panel-card-header"><h3>保险库控制</h3></div>
-          <label className="field-label">
-            主密码
-            <input type="password" value={masterPassword} onChange={(event) => setMasterPassword(event.currentTarget.value)} placeholder="输入主密码" autoComplete="off" />
-          </label>
-          <div className="button-row">
-            <button type="button" className="btn btn-primary" onClick={handleInitVault} disabled={isActionLoading("init-vault")}>{isActionLoading("init-vault") ? "初始化中..." : "初始化"}</button>
-            <button type="button" className="btn btn-secondary" onClick={handleUnlockVault} disabled={isActionLoading("unlock-vault")}>{isActionLoading("unlock-vault") ? "解锁中..." : "解锁"}</button>
-            <button type="button" className="btn btn-secondary" onClick={handleLockVault} disabled={isActionLoading("lock-vault")}>{isActionLoading("lock-vault") ? "锁定中..." : "锁定"}</button>
-          </div>
-          <p className="muted-text">状态说明：{vaultStatus?.message ?? "正在读取保险库状态..."}</p>
-        </section>
-
-        <section className="panel-card">
-          <div className="panel-card-header"><h3>Codex CLI 监控</h3><span className={`status-dot ${codexCliRunning ? "online" : "offline"}`}></span></div>
-          <div className="status-list">
-            <div><span>运行状态</span><strong>{codexCliRunning ? "运行中" : "已停止"}</strong></div>
+          <div className="panel-head"><h3>运行状态</h3></div>
+          <div className="panel-metrics">
+            <div><span>CLI 状态</span><strong>{codexCliRunning ? "运行中" : "已停止"}</strong></div>
             <div><span>进程数量</span><strong>{codexProcessCount}</strong></div>
-            <div><span>最近检测</span><strong>{formatDateTime(codexCliStatus?.last_checked_at)}</strong></div>
-            <div><span>用户输入</span><strong>{codexCliStatus?.requires_user_input ? "需要处理" : "无需输入"}</strong></div>
+            <div><span>保险库</span><strong>{vaultUnlocked ? "已解锁" : "未解锁"}</strong></div>
+            <div><span>最近检测</span><strong>{formatDateTime(codexCliStatus?.checked_at)}</strong></div>
           </div>
-          {codexCliStatus?.prompt ? <p className="callout">提示：{codexCliStatus.prompt}</p> : null}
-          {codexCliStatus?.last_event_message ? <p className="callout">事件：{codexCliStatus.last_event_message}</p> : null}
         </section>
 
         <section className="panel-card">
-          <h3>快速操作</h3>
+          <div className="panel-head"><h3>快速操作</h3></div>
           <label className="field-label">
             目标账号
             <select value={selectedAccountId} onChange={(event) => setSelectedAccountId(event.currentTarget.value)}>
@@ -850,26 +1051,48 @@ function App() {
               {accounts.map((account) => (<option key={account.id} value={account.id}>{account.name}</option>))}
             </select>
           </label>
-          <label className="checkbox-label"><input type="checkbox" checked={forceRestart} onChange={(event) => setForceRestart(event.currentTarget.checked)} />切换时强制重启 Codex 进程</label>
+          <p className="muted-text">当前选择：{selectedAccountName}</p>
+          <label className="checkbox-label">
+            <input type="checkbox" checked={forceRestart} onChange={(event) => setForceRestart(event.currentTarget.checked)} />
+            切换时强制重启 Codex 进程
+          </label>
           <div className="button-row">
-            <button type="button" className="btn btn-primary" onClick={handleSwitchSelected} disabled={!vaultUnlocked || !selectedAccountId || isActionLoading("switch-selected")}>{isActionLoading("switch-selected") ? "切换中..." : "一键切换"}</button>
-            <button type="button" className="btn btn-secondary" onClick={handleRefreshSelectedQuota} disabled={!vaultUnlocked || !selectedAccountId || isActionLoading("refresh-quota-selected")}>{isActionLoading("refresh-quota-selected") ? "刷新中..." : "刷新所选配额"}</button>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={handleSwitchSelected}
+              disabled={!vaultUnlocked || !selectedAccountId || isActionLoading("switch-selected")}
+            >
+              {isActionLoading("switch-selected") ? "切换中..." : "一键切换"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={handleRefreshSelectedQuota}
+              disabled={!vaultUnlocked || !selectedAccountId || isActionLoading("refresh-quota-selected")}
+            >
+              {isActionLoading("refresh-quota-selected") ? "刷新中..." : "刷新所选配额"}
+            </button>
           </div>
         </section>
 
-        <section className="panel-card">
-          <div className="panel-card-header">
-            <h3>运行诊断</h3>
-            <button type="button" className="btn btn-ghost" onClick={handleRefreshDiagnostics} disabled={isActionLoading("refresh-diagnostics")}>刷新</button>
-          </div>
-          {diagnostics ? (
-            <div className="status-list">
-              <div><span>认证文件</span><strong>{diagnostics.codex_auth_exists ? "存在" : "缺失"}</strong></div>
-              <div><span>结构校验</span><strong>{diagnostics.schema_ok ? "正常" : "异常"}</strong></div>
-              <div><span>进程检测</span><strong>{diagnostics.process_count}</strong></div>
-            </div>
+        <section className="panel-card panel-grow">
+          <div className="panel-head"><h3>活动时间线</h3></div>
+          {activityItems.length === 0 ? (
+            <div className="empty-block">暂无关键事件，执行登录、切换或刷新后会显示记录。</div>
           ) : (
-            <p className="muted-text">暂无诊断数据</p>
+            <div className="activity-list">
+              {activityItems.map((item) => (
+                <article className="activity-item" key={item.id}>
+                  <div className="activity-title-row">
+                    <span className={`activity-level ${item.level}`}>{item.level.toUpperCase()}</span>
+                    <strong>{item.title}</strong>
+                  </div>
+                  <p>{item.detail}</p>
+                  <small>{formatDateTime(item.created_at)}</small>
+                </article>
+              ))}
+            </div>
           )}
         </section>
       </aside>

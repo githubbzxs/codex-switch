@@ -45,16 +45,8 @@ export interface RuntimeDiagnostics {
 
 export interface CodexCliStatus {
   is_running?: boolean;
-  running?: boolean;
   process_count?: number;
   checked_at?: string | null;
-  last_checked_at?: string | null;
-  requires_user_input?: boolean;
-  prompt?: string | null;
-  current_action?: string | null;
-  last_event?: string | null;
-  last_event_message?: string | null;
-  status?: string | null;
 }
 
 export interface QuotaSnapshot {
