@@ -176,6 +176,10 @@
 - **下一步建议**：补充真实环境下配额探测兼容性样本与自动化回归测试（切换/回滚链路）。
 - **[2026-02-12] 添加账户流程修正**：新增账户改为先执行 `codex login`，登录成功后再自动保存，避免无登录重复添加。
   - Impact：`src-tauri/src/lib.rs`、`src/App.tsx`
+- **[2026-02-12] 界面体验修正**：默认暗色主题生效，表格与布局支持窗口缩放自适应，避免窄窗口显示不全。
+  - Impact：`src/App.css`、`src/App.tsx`
+- **[2026-02-12] 登录与配额链路增强**：登录改为优先 `codex login --web` 并兼容回退，登录后轮询最新 auth 再导入；配额探测地址迁移到 `chat.openai.com` 并细化失败原因。
+  - Impact：`src-tauri/src/codex.rs`、`src-tauri/src/lib.rs`、`src-tauri/src/quota.rs`
 
 ### Known Issues
 

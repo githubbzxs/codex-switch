@@ -69,7 +69,7 @@ fn import_account_from_auth_json(
         if previous == fingerprint {
             key.zeroize();
             return Err(anyhow::anyhow!(
-                "Login finished but auth is still the current account. Please switch account in browser and retry."
+                "登录完成，但检测到仍是当前账号。请在浏览器切换到新账号后重试。"
             ));
         }
     }
@@ -80,7 +80,7 @@ fn import_account_from_auth_json(
         .is_some()
     {
         key.zeroize();
-        return Err(anyhow::anyhow!("Account already exists, skip duplicate import."));
+        return Err(anyhow::anyhow!("该账号已存在，已跳过重复导入。"));
     }
 
     let encrypted = crypto::encrypt_to_base64(&key, auth_text.as_bytes())?;
@@ -124,7 +124,7 @@ async fn wait_for_login_auth_json(previous_auth_text: Option<&str>) -> anyhow::R
     }
 
     Err(anyhow::anyhow!(
-        "Login finished but ~/.codex/auth.json was not updated in time. Please confirm browser authorization and retry."
+        "登录已结束，但 ~/.codex/auth.json 未在预期时间内更新。请确认浏览器授权已完成后重试。"
     ))
 }
 
