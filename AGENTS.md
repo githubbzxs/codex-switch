@@ -185,6 +185,14 @@
   - Impact：`src/App.css`、`src/App.tsx`
 - **[2026-02-12] 登录与配额链路增强**：登录改为优先 `codex login --web` 并兼容回退，登录后轮询最新 auth 再导入；配额探测地址迁移到 `chat.openai.com` 并细化失败原因。
   - Impact：`src-tauri/src/codex.rs`、`src-tauri/src/lib.rs`、`src-tauri/src/quota.rs`
+- **[2026-02-12] 认证文件导入与桌面通知完成**：支持选择本地 `auth.json` 直接导入账户，并接入系统通知用于“需要用户操作/操作完成”提醒。
+  - Impact：`src/App.tsx`、`src/api.ts`、`src/types.ts`、`src-tauri/src/lib.rs`、`src-tauri/capabilities/default.json`
+- **[2026-02-12] 配额探测对齐 CLIProxy 请求特征**：配额查询改为 `chatgpt.com + chat.openai.com` 双域回退，并补齐 Codex 关键请求头与状态原因映射。
+  - Impact：`src-tauri/src/quota.rs`
+- **[2026-02-12] UI 重构为桌面工作台布局**：主界面改为“侧边栏 + 主工作区 + 状态面板”三栏结构，贴近 Clash Verge 风格。
+  - Impact：`src/App.tsx`、`src/App.css`
+- **[2026-02-12] 版本升级与打包产物更新**：当前发布版本提升至 `0.1.1`，并已生成对应 MSI/NSIS 安装包。
+  - Impact：`package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`
 
 ### Known Issues
 
