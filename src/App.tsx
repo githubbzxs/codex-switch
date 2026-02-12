@@ -230,6 +230,16 @@ function App() {
             new Date().toISOString(),
         };
         const previous = latestCliRef.current;
+        const previousRunning = Boolean(previous?.running ?? previous?.is_running);
+        const nextRunning = Boolean(normalized.running ?? normalized.is_running);
+
+        if (previous) {
+          if (!previousRunning && nextRunning) {
+            void notifySystem("Codex CLI 已启动", "检测到 Codex CLI 进程启动，如需输入请在终端或浏览器完成。");
+          } else if (previousRunning && !nextRunning) {
+            void notifySystem("Codex CLI 已结束", "检测到 Codex CLI 进程结束，相关操作可能已完成。");
+          }
+        }
 
         if (normalized.requires_user_input && !previous?.requires_user_input) {
           const prompt = normalized.prompt ?? normalized.last_event_message ?? "请切回终端或浏览器完成输入。";
