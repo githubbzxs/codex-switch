@@ -141,3 +141,41 @@
 - **Commands**
 - **Status / Next**
 - **Known Issues**
+
+## 项目记忆（长期）
+
+### Facts
+
+- **[2026-02-12] v0.1 目标范围**：首版聚焦 Codex CLI，本地多账户管理 + 一键切换 + 历史回滚 + 多账号配额查询。
+  - Impact：`src-tauri/src/lib.rs`、`src/App.tsx`、`README.md`
+
+### Decisions
+
+- **[2026-02-12] 切换机制选择“直接切本机登录态”**：通过覆盖 `~/.codex/auth.json` 实现账户切换，不引入本地代理。
+  - Why：你的核心诉求是“切换快、步骤少、直接生效”。
+  - Impact：`src-tauri/src/codex.rs`、`src-tauri/src/store.rs`
+
+- **[2026-02-12] 账户密文存储采用“主密码加密文件”**：使用 Argon2 派生密钥 + XChaCha20-Poly1305 加密账户 auth blob。
+  - Why：跨平台一致、安全性和实现复杂度平衡更好。
+  - Impact：`src-tauri/src/crypto.rs`、`src-tauri/src/app_state.rs`
+
+- **[2026-02-12] 配额查询采用“两路并行 + 降级”**：API 探测与页面抓取并行，拿不到精确值时降级为状态值。
+  - Why：兼顾“精确优先”和“可用性优先”。
+  - Impact：`src-tauri/src/quota.rs`、`src/App.tsx`
+
+### Commands
+
+- `npm run tauri dev`：本地开发启动
+- `npm run build`：前端构建与类型检查
+- `npm run tauri build`：桌面端打包（Windows 会产出 MSI/NSIS）
+- `cargo check`（目录 `src-tauri`）：后端快速编译检查
+
+### Status / Next
+
+- **[2026-02-12] 当前状态**：后端命令、前端管理页、构建打包已打通并可编译。
+- **下一步建议**：补充真实环境下配额探测兼容性样本与自动化回归测试（切换/回滚链路）。
+
+### Known Issues
+
+- **[2026-02-12] 精确配额依赖上游非稳定接口**：当接口结构变化时会自动降级为状态模式，避免阻断切换主流程。
+  - Verify：执行“刷新全部配额”，观察 `unknown` + reason 字段是否按预期回退。
