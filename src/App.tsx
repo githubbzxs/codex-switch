@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import {
-  createAccountFromImport,
+  createAccountFromLogin,
   deleteAccount,
   getQuotaDashboard,
   getRuntimeDiagnostics,
@@ -272,16 +272,16 @@ function App() {
   const handleImportAccount = async (event: FormEvent) => {
     event.preventDefault();
     if (!vaultUnlocked) {
-      setNotice({ kind: "error", text: "请先解锁保险库，再执行导入" });
+      setNotice({ kind: "error", text: "请先解锁保险库，再执行登录添加" });
       return;
     }
     const result = await runAction("import-account", () =>
-      createAccountFromImport(importName.trim(), parseTags(importTags)),
+      createAccountFromLogin(importName.trim(), parseTags(importTags)),
     );
     if (!result) {
       return;
     }
-    setNotice({ kind: "success", text: `已导入账户：${result.name}` });
+    setNotice({ kind: "success", text: `已完成登录并添加账户：${result.name}` });
     setImportName("");
     setImportTags("");
     await refreshAllData();
@@ -526,7 +526,7 @@ function App() {
               />
             </label>
             <button type="submit" className="btn btn-primary" disabled={!vaultUnlocked || isActionLoading("import-account")}>
-              {isActionLoading("import-account") ? "导入中..." : "新增导入"}
+              {isActionLoading("import-account") ? "登录处理中..." : "登录并添加"}
             </button>
           </form>
 
@@ -545,7 +545,7 @@ function App() {
                 {accounts.length === 0 && (
                   <tr>
                     <td className="empty-cell" colSpan={5}>
-                      暂无账户，请先执行新增导入。
+                      暂无账户，请先执行“登录并添加”。
                     </td>
                   </tr>
                 )}

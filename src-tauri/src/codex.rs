@@ -7,6 +7,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, Signal, System};
 
@@ -136,4 +137,25 @@ pub fn restart_codex() -> Result<()> {
             .context("重启 Codex CLI 失败")?;
     }
     Ok(())
+}
+
+pub fn run_codex_login(timeout_seconds: u64) -> Result<()> {
+    let mut child = Command::new("codex")
+        .arg("login")
+        .spawn()
+        .context("启动 `codex login` 失败，请确认已安装 Codex CLI")?;
+    let started_at = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().context("等待登录进程失败")? {
+            if status.success() {
+                return Ok(());
+            }
+            return Err(anyhow!("`codex login` 未成功完成（退出码：{status}）"));
+        }
+        if started_at.elapsed() > Duration::from_secs(timeout_seconds) {
+            let _ = child.kill();
+            return Err(anyhow!("登录超时，请重试并在浏览器完成授权"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }

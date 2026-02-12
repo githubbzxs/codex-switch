@@ -193,6 +193,13 @@ impl AppStore {
         encrypted_auth_blob: &str,
         fingerprint: &str,
     ) -> Result<Account> {
+        if let Some(existing) = self.find_account_by_fingerprint(fingerprint)? {
+            return Err(anyhow!(
+                "该账号已存在：{}（指纹 {}）",
+                existing.name,
+                existing.auth_fingerprint
+            ));
+        }
         let conn = self.open_conn()?;
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
@@ -215,6 +222,32 @@ impl AppStore {
         .context("写入账户失败")?;
         self.get_account(&id)?
             .ok_or_else(|| anyhow!("账户写入后未找到"))
+    }
+
+    pub fn find_account_by_fingerprint(&self, fingerprint: &str) -> Result<Option<Account>> {
+        let conn = self.open_conn()?;
+        conn.query_row(
+            r#"
+            SELECT id, name, tags_json, auth_fingerprint, created_at, updated_at, last_used_at
+            FROM accounts
+            WHERE auth_fingerprint = ?1
+            "#,
+            params![fingerprint],
+            |row| {
+                Ok(Account {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    tags: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(2)?)
+                        .unwrap_or_default(),
+                    auth_fingerprint: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    last_used_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .context("按指纹读取账户失败")
     }
 
     pub fn get_account(&self, id: &str) -> Result<Option<Account>> {

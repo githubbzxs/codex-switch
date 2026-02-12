@@ -8,7 +8,7 @@ mod store;
 use app_state::AppState;
 use codex::{
     atomic_write, codex_auth_path, compute_fingerprint, create_snapshot, kill_codex_processes,
-    read_and_validate_auth_json, restart_codex, validate_auth_json,
+    read_and_validate_auth_json, restart_codex, run_codex_login, validate_auth_json,
 };
 use models::{
     Account, QuotaDashboardItem, QuotaRefreshPolicy, QuotaSnapshot, RuntimeDiagnostics,
@@ -50,6 +50,46 @@ fn unique_tags(tags: Vec<String>) -> Vec<String> {
         .filter(|tag| !tag.is_empty())
         .filter(|tag| seen.insert(tag.clone()))
         .collect()
+}
+
+fn import_account_from_current_auth(
+    state: &AppState,
+    name: &str,
+    tags: Vec<String>,
+    previous_fingerprint: Option<&str>,
+) -> anyhow::Result<Account> {
+    let mut key = state.get_vault_key()?;
+    let auth_path = codex_auth_path()?;
+    let auth_json = read_and_validate_auth_json(&auth_path)?;
+    let auth_text = serde_json::to_string_pretty(&auth_json)?;
+    let fingerprint = compute_fingerprint(&auth_json)?;
+
+    if let Some(previous) = previous_fingerprint {
+        if previous == fingerprint {
+            key.zeroize();
+            return Err(anyhow::anyhow!(
+                "登录完成，但检测到仍是当前账号。请确认在浏览器里切换到了新账号后再试"
+            ));
+        }
+    }
+
+    if state
+        .store
+        .find_account_by_fingerprint(&fingerprint)?
+        .is_some()
+    {
+        key.zeroize();
+        return Err(anyhow::anyhow!("该账号已存在，请勿重复添加"));
+    }
+
+    let encrypted = crypto::encrypt_to_base64(&key, auth_text.as_bytes())?;
+    key.zeroize();
+    state.store.create_account(
+        &ensure_name(name, &auth_json),
+        &unique_tags(tags),
+        &encrypted,
+        &fingerprint,
+    )
 }
 
 #[tauri::command]
@@ -116,22 +156,7 @@ fn import_current_codex_auth(
     name: String,
     tags: Vec<String>,
 ) -> CmdResult<Account> {
-    map_error((|| {
-        let mut key = state.get_vault_key()?;
-        let auth_path = codex_auth_path()?;
-        let auth_json = read_and_validate_auth_json(&auth_path)?;
-        let auth_text = serde_json::to_string_pretty(&auth_json)?;
-        let fingerprint = compute_fingerprint(&auth_json)?;
-        let encrypted = crypto::encrypt_to_base64(&key, auth_text.as_bytes())?;
-        key.zeroize();
-        let account = state.store.create_account(
-            &ensure_name(&name, &auth_json),
-            &unique_tags(tags),
-            &encrypted,
-            &fingerprint,
-        )?;
-        Ok(account)
-    })())
+    map_error(import_account_from_current_auth(&state, &name, tags, None))
 }
 
 #[tauri::command]
@@ -141,6 +166,33 @@ fn create_account_from_import(
     tags: Vec<String>,
 ) -> CmdResult<Account> {
     import_current_codex_auth(state, name, tags)
+}
+
+#[tauri::command]
+async fn create_account_from_login(
+    state: State<'_, AppState>,
+    name: String,
+    tags: Vec<String>,
+) -> CmdResult<Account> {
+    map_error(
+        async move {
+            if !state.is_vault_unlocked()? {
+                return Err(anyhow::anyhow!("请先解锁保险库，再进行登录添加"));
+            }
+
+            let previous_fingerprint = codex_auth_path()
+                .ok()
+                .and_then(|path| read_and_validate_auth_json(&path).ok())
+                .and_then(|json| compute_fingerprint(&json).ok());
+
+            tauri::async_runtime::spawn_blocking(|| run_codex_login(900))
+                .await
+                .map_err(|error| anyhow::anyhow!("等待登录任务失败: {error}"))??;
+
+            import_account_from_current_auth(&state, &name, tags, previous_fingerprint.as_deref())
+        }
+        .await,
+    )
 }
 
 #[tauri::command]
@@ -501,6 +553,7 @@ pub fn run() {
             vault_status,
             import_current_codex_auth,
             create_account_from_import,
+            create_account_from_login,
             list_accounts,
             update_account_meta,
             delete_account,

@@ -38,6 +38,10 @@ export function createAccountFromImport(name: string, tags: string[]): Promise<A
   return invokeCommand("create_account_from_import", { name, tags });
 }
 
+export function createAccountFromLogin(name: string, tags: string[]): Promise<Account> {
+  return invokeCommand("create_account_from_login", { name, tags });
+}
+
 export function listAccounts(): Promise<Account[]> {
   return invokeCommand("list_accounts");
 }
