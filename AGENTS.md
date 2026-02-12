@@ -163,12 +163,17 @@
   - Why：兼顾“精确优先”和“可用性优先”。
   - Impact：`src-tauri/src/quota.rs`、`src/App.tsx`
 
+- **[2026-02-12] 发布流程固定为“自动递增版本 + 自动打包”**：每次完成功能/修复后，必须先将版本号按 patch 递增，再执行桌面端打包。
+  - Why：避免“代码已更新但安装包仍是旧版”的发布错位，便于你直接分发与回溯。
+  - Impact：`package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`
+
 ### Commands
 
 - `npm run tauri dev`：本地开发启动
 - `npm run build`：前端构建与类型检查
 - `npm run tauri build`：桌面端打包（Windows 会产出 MSI/NSIS）
 - `cargo check`（目录 `src-tauri`）：后端快速编译检查
+- `npm version patch --no-git-tag-version`：本地自动递增补丁版本号（如 0.1.0 -> 0.1.1）
 
 ### Status / Next
 
