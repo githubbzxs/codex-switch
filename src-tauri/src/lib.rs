@@ -16,11 +16,13 @@ use models::{
 };
 use quota::{ensure_access_token, probe_quota};
 use serde_json::Value;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
 use tauri::State;
 use zeroize::Zeroize;
 
 type CmdResult<T> = Result<T, String>;
+const LOGIN_AUTH_POLL_MAX_ATTEMPTS: usize = 8;
+const LOGIN_AUTH_POLL_INTERVAL_MS: u64 = 500;
 
 fn map_error<T>(result: anyhow::Result<T>) -> CmdResult<T> {
     result.map_err(|error| error.to_string())
@@ -52,15 +54,14 @@ fn unique_tags(tags: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn import_account_from_current_auth(
+fn import_account_from_auth_json(
     state: &AppState,
     name: &str,
     tags: Vec<String>,
     previous_fingerprint: Option<&str>,
+    auth_json: Value,
 ) -> anyhow::Result<Account> {
     let mut key = state.get_vault_key()?;
-    let auth_path = codex_auth_path()?;
-    let auth_json = read_and_validate_auth_json(&auth_path)?;
     let auth_text = serde_json::to_string_pretty(&auth_json)?;
     let fingerprint = compute_fingerprint(&auth_json)?;
 
@@ -68,7 +69,7 @@ fn import_account_from_current_auth(
         if previous == fingerprint {
             key.zeroize();
             return Err(anyhow::anyhow!(
-                "登录完成，但检测到仍是当前账号。请确认在浏览器里切换到了新账号后再试"
+                "Login finished but auth is still the current account. Please switch account in browser and retry."
             ));
         }
     }
@@ -79,7 +80,7 @@ fn import_account_from_current_auth(
         .is_some()
     {
         key.zeroize();
-        return Err(anyhow::anyhow!("该账号已存在，请勿重复添加"));
+        return Err(anyhow::anyhow!("Account already exists, skip duplicate import."));
     }
 
     let encrypted = crypto::encrypt_to_base64(&key, auth_text.as_bytes())?;
@@ -90,6 +91,41 @@ fn import_account_from_current_auth(
         &encrypted,
         &fingerprint,
     )
+}
+
+fn import_account_from_current_auth(
+    state: &AppState,
+    name: &str,
+    tags: Vec<String>,
+    previous_fingerprint: Option<&str>,
+) -> anyhow::Result<Account> {
+    let auth_path = codex_auth_path()?;
+    let auth_json = read_and_validate_auth_json(&auth_path)?;
+    import_account_from_auth_json(state, name, tags, previous_fingerprint, auth_json)
+}
+
+async fn wait_for_login_auth_json(previous_auth_text: Option<&str>) -> anyhow::Result<Value> {
+    let auth_path = codex_auth_path()?;
+    let previous_auth_text = previous_auth_text.map(str::to_owned);
+
+    for _ in 0..LOGIN_AUTH_POLL_MAX_ATTEMPTS {
+        if let Ok(current_text) = fs::read_to_string(&auth_path) {
+            let updated = match previous_auth_text.as_ref() {
+                Some(previous) => previous != &current_text,
+                None => true,
+            };
+            if updated {
+                if let Ok(json) = validate_auth_json(&current_text) {
+                    return Ok(json);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(LOGIN_AUTH_POLL_INTERVAL_MS)).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "Login finished but ~/.codex/auth.json was not updated in time. Please confirm browser authorization and retry."
+    ))
 }
 
 #[tauri::command]
@@ -180,16 +216,25 @@ async fn create_account_from_login(
                 return Err(anyhow::anyhow!("请先解锁保险库，再进行登录添加"));
             }
 
-            let previous_fingerprint = codex_auth_path()
-                .ok()
-                .and_then(|path| read_and_validate_auth_json(&path).ok())
+            let auth_path = codex_auth_path()?;
+            let previous_auth_text = fs::read_to_string(&auth_path).ok();
+            let previous_fingerprint = previous_auth_text
+                .as_deref()
+                .and_then(|text| validate_auth_json(text).ok())
                 .and_then(|json| compute_fingerprint(&json).ok());
 
             tauri::async_runtime::spawn_blocking(|| run_codex_login(900))
                 .await
                 .map_err(|error| anyhow::anyhow!("等待登录任务失败: {error}"))??;
 
-            import_account_from_current_auth(&state, &name, tags, previous_fingerprint.as_deref())
+            let latest_auth_json = wait_for_login_auth_json(previous_auth_text.as_deref()).await?;
+            import_account_from_auth_json(
+                &state,
+                &name,
+                tags,
+                previous_fingerprint.as_deref(),
+                latest_auth_json,
+            )
         }
         .await,
     )

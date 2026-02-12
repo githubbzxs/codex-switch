@@ -41,10 +41,11 @@ pub async fn probe_quota(access_token: &str, timeout_ms: u64) -> QuotaProbeResul
 
 async fn probe_via_api(access_token: &str, timeout_ms: u64) -> Result<QuotaProbeResult> {
     let endpoints = [
-        "https://chatgpt.com/backend-api/codex/usage",
-        "https://chatgpt.com/backend-api/usage",
+        "https://chat.openai.com/backend-api/codex/usage",
+        "https://chat.openai.com/backend-api/usage",
     ];
     let client = build_client(timeout_ms)?;
+    let mut last_reason = "source_unavailable".to_string();
 
     for endpoint in endpoints {
         let response = client
@@ -70,6 +71,7 @@ async fn probe_via_api(access_token: &str, timeout_ms: u64) -> Result<QuotaProbe
             });
         }
         if !response.status().is_success() {
+            last_reason = reason_from_status(response.status()).to_string();
             continue;
         }
 
@@ -86,13 +88,13 @@ async fn probe_via_api(access_token: &str, timeout_ms: u64) -> Result<QuotaProbe
         }
     }
 
-    Ok(QuotaProbeResult::unavailable("source_unavailable", "api"))
+    Ok(QuotaProbeResult::unavailable(&last_reason, "api"))
 }
 
 async fn probe_via_web(access_token: &str, timeout_ms: u64) -> Result<QuotaProbeResult> {
     let client = build_client(timeout_ms)?;
     let response = client
-        .get("https://chatgpt.com/codex")
+        .get("https://chat.openai.com/codex")
         .bearer_auth(access_token)
         .send()
         .await
@@ -102,7 +104,7 @@ async fn probe_via_web(access_token: &str, timeout_ms: u64) -> Result<QuotaProbe
         return Ok(QuotaProbeResult::unavailable("auth_expired", "web"));
     }
     if !response.status().is_success() {
-        return Ok(QuotaProbeResult::unavailable("source_unavailable", "web"));
+        return Ok(QuotaProbeResult::unavailable(reason_from_status(response.status()), "web"));
     }
     let html = response.text().await.context("读取配额页面内容失败")?;
     if let Some(result) = extract_from_html(&html) {
@@ -147,6 +149,17 @@ fn merge_probe_results(
     })
 }
 
+fn reason_from_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::FORBIDDEN => "forbidden",
+        StatusCode::NOT_FOUND
+        | StatusCode::MOVED_PERMANENTLY
+        | StatusCode::FOUND
+        | StatusCode::TEMPORARY_REDIRECT
+        | StatusCode::PERMANENT_REDIRECT => "endpoint_changed",
+        _ => "source_unavailable",
+    }
+}
 fn build_client(timeout_ms: u64) -> Result<Client> {
     let mut headers = header::HeaderMap::new();
     headers.insert(
