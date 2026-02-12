@@ -163,6 +163,18 @@
   - Why：兼顾“精确优先”和“可用性优先”。
   - Impact：`src-tauri/src/quota.rs`、`src/App.tsx`
 
+- **[2026-02-12] 登录启动器改为“多路径探测 + 参数回退”**：Windows 下优先探测 `codex.cmd/codex.ps1/codex.exe/vendor codex.exe`，并保留 `--web -> login` 回退。
+  - Why：修复桌面环境 `program not found` 与 PATH 不一致导致的登录失败。
+  - Impact：`src-tauri/src/codex.rs`
+
+- **[2026-02-12] 配额探测升级为“CLI 同源链路优先”**：优先请求 `/backend-api/api/codex/usage` 与 `/backend-api/wham/usage`，解析 `x-codex-*` 响应头，失败再回退旧链路。
+  - Why：对齐 Codex CLI 实际请求特征，提升可用率与状态准确度。
+  - Impact：`src-tauri/src/quota.rs`
+
+- **[2026-02-12] Codex 进程识别口径收敛到“真实 CLI 主进程”**：统一统计与 kill 过滤规则，排除 `codex-switch` 自身与误命中进程。
+  - Why：修复进程数量不准确与误杀风险。
+  - Impact：`src-tauri/src/codex.rs`、`src-tauri/src/lib.rs`
+
 - **[2026-02-12] 发布流程固定为“自动递增版本 + 自动打包”**：每次完成功能/修复后，必须先将版本号按 patch 递增，再执行桌面端打包。
   - Why：避免“代码已更新但安装包仍是旧版”的发布错位，便于你直接分发与回溯。
   - Impact：`package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`
@@ -193,6 +205,10 @@
   - Impact：`src/App.tsx`、`src/App.css`
 - **[2026-02-12] 版本升级与打包产物更新**：当前发布版本提升至 `0.1.1`，并已生成对应 MSI/NSIS 安装包。
   - Impact：`package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`
+- **[2026-02-12] 控制台布局深度重构并收敛通知策略**：改为“导航 + 工作区 + 活动侧栏”信息架构，仅对关键事件触发系统通知并保留页面内兜底提示。
+  - Impact：`src/App.tsx`、`src/App.css`、`src/types.ts`
+- **[2026-02-12] 版本升级与打包产物更新**：当前发布版本提升至 `0.1.2`，并已生成对应 MSI/NSIS 安装包。
+  - Impact：`package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`
 
 ### Known Issues
 
@@ -200,3 +216,5 @@
   - Verify：执行“刷新全部配额”，观察 `unknown` + reason 字段是否按预期回退。
 - **[2026-02-12] 登录流程依赖本机可调用 `codex login`**：若系统 PATH 未包含 codex，将无法触发登录并给出错误提示。
   - Verify：点击“登录并添加”并观察是否成功打开登录流程。
+- **[2026-02-12] Windows 登录探测仍依赖本机安装位置可发现**：若 npm 全局目录与常见 vendor 路径均不可达，将回退失败并输出探测摘要。
+  - Verify：点击“登录并添加”，若失败检查错误信息中的“已尝试路径”是否符合预期。
