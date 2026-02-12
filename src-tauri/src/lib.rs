@@ -5,14 +5,15 @@ mod models;
 mod quota;
 mod store;
 
+use anyhow::Context;
 use app_state::AppState;
 use codex::{
     atomic_write, codex_auth_path, compute_fingerprint, create_snapshot, kill_codex_processes,
     read_and_validate_auth_json, restart_codex, run_codex_login, validate_auth_json,
 };
 use models::{
-    Account, QuotaDashboardItem, QuotaRefreshPolicy, QuotaSnapshot, RuntimeDiagnostics,
-    SimpleStatus, SwitchHistory, SwitchResult,
+    Account, CodexCliStatus, QuotaDashboardItem, QuotaRefreshPolicy, QuotaSnapshot,
+    RuntimeDiagnostics, SimpleStatus, SwitchHistory, SwitchResult,
 };
 use quota::{ensure_access_token, probe_quota};
 use serde_json::Value;
@@ -202,6 +203,28 @@ fn create_account_from_import(
     tags: Vec<String>,
 ) -> CmdResult<Account> {
     import_current_codex_auth(state, name, tags)
+}
+
+#[tauri::command]
+fn create_account_from_auth_file(
+    state: State<'_, AppState>,
+    path: String,
+    name: String,
+    tags: Vec<String>,
+) -> CmdResult<Account> {
+    map_error((|| {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow::anyhow!("认证文件路径不能为空"));
+        }
+
+        let file_path = PathBuf::from(trimmed);
+        let auth_text = fs::read_to_string(&file_path)
+            .with_context(|| format!("读取认证文件失败: {}", file_path.display()))?;
+        let auth_json =
+            validate_auth_json(&auth_text).with_context(|| "认证文件格式校验失败".to_string())?;
+        import_account_from_auth_json(&state, &name, tags, None, auth_json)
+    })())
 }
 
 #[tauri::command]
@@ -444,7 +467,12 @@ async fn refresh_quota(
                 let auth_text = String::from_utf8(decrypted)?;
                 let auth_json: Value = serde_json::from_str(&auth_text)?;
                 let access_token = ensure_access_token(&auth_json)?;
-                let probe = probe_quota(&access_token, timeout_ms).await;
+                let chatgpt_account_id = auth_json
+                    .pointer("/tokens/account_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let probe = probe_quota(&access_token, chatgpt_account_id, timeout_ms).await;
                 let saved = state.store.save_quota_snapshot(
                     &account.account.id,
                     &probe.mode,
@@ -537,27 +565,7 @@ fn get_runtime_diagnostics(state: State<'_, AppState>) -> CmdResult<RuntimeDiagn
             false
         };
 
-        let process_count = {
-            use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
-            let refresh = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
-            let mut system = System::new_with_specifics(refresh);
-            system.refresh_processes(ProcessesToUpdate::All, true);
-            system
-                .processes()
-                .values()
-                .filter(|process| {
-                    let name = process.name().to_string_lossy().to_lowercase();
-                    let cmdline = process
-                        .cmd()
-                        .iter()
-                        .map(|part| part.to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .to_lowercase();
-                    name.contains("codex") || cmdline.contains("codex")
-                })
-                .count()
-        };
+        let process_count = count_codex_processes();
 
         Ok(RuntimeDiagnostics {
             codex_auth_path: auth_path.display().to_string(),
@@ -568,6 +576,40 @@ fn get_runtime_diagnostics(state: State<'_, AppState>) -> CmdResult<RuntimeDiagn
             process_count,
         })
     })())
+}
+
+#[tauri::command]
+fn get_codex_cli_status() -> CmdResult<CodexCliStatus> {
+    map_error((|| {
+        let process_count = count_codex_processes();
+        Ok(CodexCliStatus {
+            is_running: process_count > 0,
+            process_count,
+            checked_at: chrono::Utc::now().to_rfc3339(),
+        })
+    })())
+}
+
+fn count_codex_processes() -> usize {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+    let refresh = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
+    let mut system = System::new_with_specifics(refresh);
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    system
+        .processes()
+        .values()
+        .filter(|process| {
+            let name = process.name().to_string_lossy().to_lowercase();
+            let cmdline = process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            name.contains("codex") || cmdline.contains("codex")
+        })
+        .count()
 }
 
 fn state_rank(state: Option<&str>) -> u8 {
@@ -590,6 +632,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             init_vault,
@@ -598,6 +642,7 @@ pub fn run() {
             vault_status,
             import_current_codex_auth,
             create_account_from_import,
+            create_account_from_auth_file,
             create_account_from_login,
             list_accounts,
             update_account_meta,
@@ -610,6 +655,7 @@ pub fn run() {
             list_quota_snapshots,
             set_quota_refresh_policy,
             get_runtime_diagnostics,
+            get_codex_cli_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

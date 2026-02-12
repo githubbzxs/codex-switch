@@ -41,6 +41,13 @@ pub struct RuntimeDiagnostics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexCliStatus {
+    pub is_running: bool,
+    pub process_count: usize,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaSnapshot {
     pub id: String,
     pub account_id: String,

@@ -1,8 +1,24 @@
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
-use reqwest::{header, Client, StatusCode};
+use reqwest::{header, Client, RequestBuilder, StatusCode};
 use serde_json::Value;
 use std::time::Duration;
+use uuid::Uuid;
+
+const CODEX_CLIENT_VERSION: &str = "0.98.0";
+const CODEX_OPENAI_BETA: &str = "responses=experimental";
+const CODEX_USER_AGENT: &str = "codex_cli_rs/0.98.0 (Windows NT 10.0; x86_64) codex-switch";
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const API_ENDPOINTS: [(&str, &str); 4] = [
+    ("https://chatgpt.com", "/backend-api/codex/usage"),
+    ("https://chatgpt.com", "/backend-api/usage"),
+    ("https://chat.openai.com", "/backend-api/codex/usage"),
+    ("https://chat.openai.com", "/backend-api/usage"),
+];
+const WEB_ENDPOINTS: [(&str, &str); 2] = [
+    ("https://chatgpt.com", "/codex"),
+    ("https://chat.openai.com", "/codex"),
+];
 
 #[derive(Debug, Clone)]
 pub struct QuotaProbeResult {
@@ -31,34 +47,51 @@ impl QuotaProbeResult {
     }
 }
 
-pub async fn probe_quota(access_token: &str, timeout_ms: u64) -> QuotaProbeResult {
+pub async fn probe_quota(
+    access_token: &str,
+    account_id: Option<&str>,
+    timeout_ms: u64,
+) -> QuotaProbeResult {
     let (api_result, web_result) = tokio::join!(
-        probe_via_api(access_token, timeout_ms),
-        probe_via_web(access_token, timeout_ms)
+        probe_via_api(access_token, account_id, timeout_ms),
+        probe_via_web(access_token, account_id, timeout_ms)
     );
     merge_probe_results(api_result, web_result)
 }
 
-async fn probe_via_api(access_token: &str, timeout_ms: u64) -> Result<QuotaProbeResult> {
-    let endpoints = [
-        "https://chat.openai.com/backend-api/codex/usage",
-        "https://chat.openai.com/backend-api/usage",
-    ];
+async fn probe_via_api(
+    access_token: &str,
+    account_id: Option<&str>,
+    timeout_ms: u64,
+) -> Result<QuotaProbeResult> {
     let client = build_client(timeout_ms)?;
     let mut last_reason = "source_unavailable".to_string();
 
-    for endpoint in endpoints {
-        let response = client
-            .get(endpoint)
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .with_context(|| format!("调用配额接口失败: {endpoint}"))?;
+    for (domain, path) in API_ENDPOINTS {
+        let endpoint = format!("{domain}{path}");
+        let request = apply_codex_headers(
+            client.get(&endpoint),
+            access_token,
+            account_id,
+            "application/json",
+        );
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_reason = reason_from_request_error(&error, &endpoint);
+                continue;
+            }
+        };
 
-        if response.status() == StatusCode::UNAUTHORIZED {
-            return Ok(QuotaProbeResult::unavailable("auth_expired", "api"));
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Ok(QuotaProbeResult::unavailable(
+                &reason_from_http_status(status, &endpoint),
+                "api",
+            ));
         }
-        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+
+        if status == StatusCode::TOO_MANY_REQUESTS {
             return Ok(QuotaProbeResult {
                 mode: "state".to_string(),
                 remaining_value: None,
@@ -67,18 +100,23 @@ async fn probe_via_api(access_token: &str, timeout_ms: u64) -> Result<QuotaProbe
                 reset_at: None,
                 source: "api".to_string(),
                 confidence: 95,
-                reason: Some("rate_limited".to_string()),
+                reason: Some(reason_from_http_status(status, &endpoint)),
             });
         }
-        if !response.status().is_success() {
-            last_reason = reason_from_status(response.status()).to_string();
+
+        if !status.is_success() {
+            last_reason = reason_from_http_status(status, &endpoint);
             continue;
         }
 
-        let json = response
-            .json::<Value>()
-            .await
-            .context("解析配额 JSON 失败")?;
+        let json = match response.json::<Value>().await {
+            Ok(json) => json,
+            Err(error) => {
+                last_reason = format!("json_parse_failed@{}:{}", endpoint, short_error(&error));
+                continue;
+            }
+        };
+
         if let Some(result) = extract_exact_from_json(&json, "api") {
             return Ok(result);
         }
@@ -86,32 +124,64 @@ async fn probe_via_api(access_token: &str, timeout_ms: u64) -> Result<QuotaProbe
         if let Some(state) = extract_state_from_json(&json, "api") {
             return Ok(state);
         }
+
+        last_reason = format!("quota_field_not_found@{endpoint}");
     }
 
     Ok(QuotaProbeResult::unavailable(&last_reason, "api"))
 }
 
-async fn probe_via_web(access_token: &str, timeout_ms: u64) -> Result<QuotaProbeResult> {
+async fn probe_via_web(
+    access_token: &str,
+    account_id: Option<&str>,
+    timeout_ms: u64,
+) -> Result<QuotaProbeResult> {
     let client = build_client(timeout_ms)?;
-    let response = client
-        .get("https://chat.openai.com/codex")
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .context("抓取配额页面失败")?;
+    let mut last_reason = "source_unavailable".to_string();
 
-    if response.status() == StatusCode::UNAUTHORIZED {
-        return Ok(QuotaProbeResult::unavailable("auth_expired", "web"));
-    }
-    if !response.status().is_success() {
-        return Ok(QuotaProbeResult::unavailable(reason_from_status(response.status()), "web"));
-    }
-    let html = response.text().await.context("读取配额页面内容失败")?;
-    if let Some(result) = extract_from_html(&html) {
-        return Ok(result);
+    for (domain, path) in WEB_ENDPOINTS {
+        let endpoint = format!("{domain}{path}");
+        let request = apply_codex_headers(
+            client.get(&endpoint),
+            access_token,
+            account_id,
+            "text/html,application/xhtml+xml",
+        );
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_reason = reason_from_request_error(&error, &endpoint);
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Ok(QuotaProbeResult::unavailable(
+                &reason_from_http_status(status, &endpoint),
+                "web",
+            ));
+        }
+
+        if !status.is_success() {
+            last_reason = reason_from_http_status(status, &endpoint);
+            continue;
+        }
+
+        let html = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                last_reason = format!("html_read_failed@{}:{}", endpoint, short_error(&error));
+                continue;
+            }
+        };
+        if let Some(result) = extract_from_html(&html) {
+            return Ok(result);
+        }
+        last_reason = format!("html_parse_failed@{endpoint}");
     }
 
-    Ok(QuotaProbeResult::unavailable("parse_failed", "web"))
+    Ok(QuotaProbeResult::unavailable(&last_reason, "web"))
 }
 
 fn merge_probe_results(
@@ -149,22 +219,75 @@ fn merge_probe_results(
     })
 }
 
-fn reason_from_status(status: StatusCode) -> &'static str {
-    match status {
-        StatusCode::FORBIDDEN => "forbidden",
-        StatusCode::NOT_FOUND
-        | StatusCode::MOVED_PERMANENTLY
+fn apply_codex_headers(
+    request: RequestBuilder,
+    access_token: &str,
+    account_id: Option<&str>,
+    accept: &'static str,
+) -> RequestBuilder {
+    let mut request = request
+        .bearer_auth(access_token)
+        .header("Version", CODEX_CLIENT_VERSION)
+        .header("Openai-Beta", CODEX_OPENAI_BETA)
+        .header("Session_id", Uuid::new_v4().to_string())
+        .header(header::USER_AGENT, CODEX_USER_AGENT)
+        .header("Originator", CODEX_ORIGINATOR)
+        .header(header::ACCEPT, accept)
+        .header(header::CONNECTION, "Keep-Alive");
+
+    if let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) {
+        request = request.header("Chatgpt-Account-Id", account_id);
+    }
+    request
+}
+
+fn reason_from_http_status(status: StatusCode, endpoint: &str) -> String {
+    let reason = match status {
+        StatusCode::UNAUTHORIZED => "auth_expired",
+        StatusCode::FORBIDDEN => "auth_forbidden",
+        StatusCode::NOT_FOUND => "endpoint_not_found",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+        StatusCode::MOVED_PERMANENTLY
         | StatusCode::FOUND
         | StatusCode::TEMPORARY_REDIRECT
-        | StatusCode::PERMANENT_REDIRECT => "endpoint_changed",
+        | StatusCode::PERMANENT_REDIRECT => "endpoint_redirected",
+        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => "upstream_timeout",
+        StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::INTERNAL_SERVER_ERROR => "upstream_unavailable",
+        _ if status.is_client_error() => "client_error",
+        _ if status.is_server_error() => "server_error",
         _ => "source_unavailable",
-    }
+    };
+    format!("{reason}@{}:{endpoint}", status.as_u16())
 }
+
+fn reason_from_request_error(error: &reqwest::Error, endpoint: &str) -> String {
+    let reason = if error.is_timeout() {
+        "request_timeout"
+    } else if error.is_connect() {
+        "connect_failed"
+    } else if error.is_request() {
+        "request_build_failed"
+    } else if error.is_decode() {
+        "response_decode_failed"
+    } else {
+        "request_failed"
+    };
+    format!("{reason}@{endpoint}")
+}
+
+fn short_error(error: &impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    let compact = message.replace('\n', " ").replace('\r', " ");
+    compact.chars().take(120).collect()
+}
+
 fn build_client(timeout_ms: u64) -> Result<Client> {
     let mut headers = header::HeaderMap::new();
     headers.insert(
         header::USER_AGENT,
-        header::HeaderValue::from_static("codex-switch/0.1"),
+        header::HeaderValue::from_static(CODEX_USER_AGENT),
     );
     headers.insert(
         header::ACCEPT,
@@ -174,7 +297,7 @@ fn build_client(timeout_ms: u64) -> Result<Client> {
         .timeout(Duration::from_millis(timeout_ms))
         .default_headers(headers)
         .build()
-        .context("初始化 HTTP 客户端失败")
+        .context("初始化配额 HTTP 客户端失败")
 }
 
 fn extract_exact_from_json(json: &Value, source: &str) -> Option<QuotaProbeResult> {
@@ -197,7 +320,7 @@ fn extract_exact_from_json(json: &Value, source: &str) -> Option<QuotaProbeResul
         quota_state: state_from_value(value).to_string(),
         reset_at: extract_text_by_key(json, &["reset_at", "resetAt", "next_reset"]),
         source: source.to_string(),
-        confidence: 85,
+        confidence: 88,
         reason: None,
     })
 }
@@ -222,7 +345,7 @@ fn extract_state_from_json(json: &Value, source: &str) -> Option<QuotaProbeResul
 }
 
 fn extract_from_html(html: &str) -> Option<QuotaProbeResult> {
-    let regex = Regex::new("(?i)(remaining|quota)\\D{0,12}([0-9]+(?:\\.[0-9]+)?)").ok()?;
+    let regex = Regex::new("(?i)(remaining|quota)\\D{0,20}([0-9]+(?:\\.[0-9]+)?)").ok()?;
     if let Some(capture) = regex.captures(html) {
         let value = capture.get(2)?.as_str().parse::<f64>().ok()?;
         return Some(QuotaProbeResult {
@@ -236,7 +359,12 @@ fn extract_from_html(html: &str) -> Option<QuotaProbeResult> {
             reason: None,
         });
     }
-    if html.to_lowercase().contains("limit reached") {
+
+    let lower = html.to_lowercase();
+    if lower.contains("limit reached")
+        || lower.contains("quota exceeded")
+        || lower.contains("you've reached your usage limit")
+    {
         return Some(QuotaProbeResult {
             mode: "state".to_string(),
             remaining_value: None,
