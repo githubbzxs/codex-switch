@@ -1,6 +1,5 @@
 ﻿
 import { open } from "@tauri-apps/plugin-dialog";
-import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createAccountFromAuthFile,
@@ -35,11 +34,8 @@ import "./App.css";
 
 const HISTORY_LIMIT = 30;
 const CLI_STATUS_POLL_MS = 6000;
-const ACTIVITY_LIMIT = 20;
 
 type WorkspaceView = "overview" | "vault" | "accounts" | "quota" | "history" | "diagnostics";
-type ActivityLevel = UiNotice["kind"];
-type NoticeMode = "none" | "fallback" | "always";
 
 interface NavItem {
   id: WorkspaceView;
@@ -50,14 +46,6 @@ interface NavItem {
 interface NavGroup {
   title: string;
   items: NavItem[];
-}
-
-interface ActivityItem {
-  id: string;
-  level: ActivityLevel;
-  title: string;
-  detail: string;
-  created_at: string;
 }
 
 interface RunActionOptions {
@@ -160,7 +148,6 @@ function App() {
   const [diagnostics, setDiagnostics] = useState<RuntimeDiagnostics | null>(null);
   const [codexCliStatus, setCodexCliStatus] = useState<CodexCliStatus | null>(null);
   const [notice, setNotice] = useState<UiNotice | null>(null);
-  const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
 
   const [masterPassword, setMasterPassword] = useState("");
   const [newAccountName, setNewAccountName] = useState("");
@@ -204,46 +191,6 @@ function App() {
   );
 
   const isActionLoading = useCallback((key: string) => Boolean(actionLoading[key]), [actionLoading]);
-
-  const appendActivity = useCallback((level: ActivityLevel, title: string, detail: string) => {
-    setActivityItems((previous) => {
-      const next: ActivityItem = {
-        id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-        level,
-        title,
-        detail,
-        created_at: new Date().toISOString(),
-      };
-      return [next, ...previous].slice(0, ACTIVITY_LIMIT);
-    });
-  }, []);
-
-  const notifySystem = useCallback(async (title: string, body: string): Promise<boolean> => {
-    try {
-      let granted = await isPermissionGranted();
-      if (!granted) {
-        const permission = await requestPermission();
-        granted = permission === "granted";
-      }
-      if (!granted) return false;
-      await sendNotification({ title, body });
-      return true;
-    } catch (error) {
-      console.warn("发送系统通知失败", error);
-      return false;
-    }
-  }, []);
-
-  const emitEvent = useCallback(
-    async (title: string, detail: string, level: ActivityLevel = "info", noticeMode: NoticeMode = "fallback") => {
-      appendActivity(level, title, detail);
-      const delivered = await notifySystem(title, detail);
-      if (noticeMode === "always" || (noticeMode === "fallback" && !delivered)) {
-        setNotice({ kind: level, text: `${title}：${detail}` });
-      }
-    },
-    [appendActivity, notifySystem],
-  );
 
   const runAction = useCallback(
     async <T,>(key: string, action: () => Promise<T>, options?: RunActionOptions): Promise<T | null> => {
@@ -302,9 +249,9 @@ function App() {
         const previous = latestCliRef.current;
         if (previous && Boolean(previous.is_running) !== Boolean(normalized.is_running)) {
           if (normalized.is_running) {
-            void emitEvent("Codex CLI 已启动", `检测到 ${normalized.process_count ?? 0} 个相关进程。`, "info", "fallback");
+            setNotice({ kind: "info", text: `Codex CLI 已启动：检测到 ${normalized.process_count ?? 0} 个相关进程。` });
           } else {
-            void emitEvent("Codex CLI 已停止", "检测到 Codex CLI 进程结束。", "info", "fallback");
+            setNotice({ kind: "info", text: "Codex CLI 已停止：检测到 Codex CLI 进程结束。" });
           }
         }
 
@@ -316,7 +263,7 @@ function App() {
         }
       }
     },
-    [emitEvent],
+    [],
   );
 
   useEffect(() => {
@@ -412,7 +359,7 @@ function App() {
       return;
     }
 
-    void emitEvent("登录流程已启动", "已调用 Codex 登录，请在浏览器完成授权后返回应用。", "info", "always");
+    setNotice({ kind: "info", text: "登录流程已启动：已调用 Codex 登录，请在浏览器完成授权后返回应用。" });
 
     const result = await runAction(
       "import-account-login",
@@ -420,13 +367,13 @@ function App() {
       {
         suppressNotice: true,
         onError: (message) => {
-          void emitEvent("登录并添加失败", message, "error", "always");
+          setNotice({ kind: "error", text: `登录并添加失败：${message}` });
         },
       },
     );
     if (!result) return;
 
-    void emitEvent("登录并添加成功", `账号 ${result.name} 已保存到保险库。`, "success", "always");
+    setNotice({ kind: "success", text: `登录并添加成功：账号 ${result.name} 已保存到保险库。` });
     clearCreateFields();
     await refreshAllData();
     await refreshCodexCliStatus(false);
@@ -493,14 +440,15 @@ function App() {
     const result = await runAction(actionKey, () => switchAccount(accountId, forceRestart), {
       suppressNotice: true,
       onError: (message) => {
-        void emitEvent("账号切换失败", `${accountName}：${message}`, "error", "always");
+        setNotice({ kind: "error", text: `账号切换失败：${accountName}：${message}` });
       },
     });
     if (!result) return;
 
-    const level: ActivityLevel = result.success ? "success" : "error";
-    const title = result.success ? "账号切换成功" : "账号切换失败";
-    void emitEvent(title, `${accountName}：${result.message}`, level, "always");
+    setNotice({
+      kind: result.success ? "success" : "error",
+      text: `${result.success ? "账号切换成功" : "账号切换失败"}：${accountName}：${result.message}`,
+    });
 
     await refreshAllData();
     await refreshCodexCliStatus(false);
@@ -528,13 +476,13 @@ function App() {
     const result = await runAction(actionKey, () => refreshQuota(accountId, true), {
       suppressNotice: true,
       onError: (message) => {
-        void emitEvent("配额刷新失败", `${scopeLabel}：${message}`, "error", "always");
+        setNotice({ kind: "error", text: `配额刷新失败：${scopeLabel}：${message}` });
       },
     });
     if (!result) return;
 
     const message = `已刷新${scopeLabel}，共 ${result.length} 条记录。`;
-    void emitEvent("配额刷新完成", message, "success", "always");
+    setNotice({ kind: "success", text: `配额刷新完成：${message}` });
     await refreshAllData();
   };
 
@@ -1026,76 +974,46 @@ function App() {
           <span>最近检测：{formatDateTime(codexCliStatus?.checked_at)}</span>
         </div>
 
+        <section className="view-card quick-actions-card">
+          <div className="card-head"><h3>快捷操作</h3></div>
+          <div className="quick-action-grid">
+            <label className="field-label">
+              目标账号
+              <select value={selectedAccountId} onChange={(event) => setSelectedAccountId(event.currentTarget.value)}>
+                {accounts.length === 0 && <option value="">暂无可选账号</option>}
+                {accounts.map((account) => (<option key={account.id} value={account.id}>{account.name}</option>))}
+              </select>
+            </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={forceRestart} onChange={(event) => setForceRestart(event.currentTarget.checked)} />
+              切换时强制重启 Codex 进程
+            </label>
+            <p className="muted-text">当前选择：{selectedAccountName}</p>
+            <div className="button-row quick-action-buttons">
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleSwitchSelected}
+                disabled={!vaultUnlocked || !selectedAccountId || isActionLoading("switch-selected")}
+              >
+                {isActionLoading("switch-selected") ? "切换中..." : "一键切换"}
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={handleRefreshSelectedQuota}
+                disabled={!vaultUnlocked || !selectedAccountId || isActionLoading("refresh-quota-selected")}
+              >
+                {isActionLoading("refresh-quota-selected") ? "刷新中..." : "刷新所选配额"}
+              </button>
+            </div>
+          </div>
+        </section>
+
         {notice && <div className={`inline-notice notice-${notice.kind}`}>{notice.text}</div>}
 
         <section className="content-region">{workspaceContent}</section>
       </main>
-
-      <aside className="activity-sidebar">
-        <section className="panel-card">
-          <div className="panel-head"><h3>运行状态</h3></div>
-          <div className="panel-metrics">
-            <div><span>CLI 状态</span><strong>{codexCliRunning ? "运行中" : "已停止"}</strong></div>
-            <div><span>进程数量</span><strong>{codexProcessCount}</strong></div>
-            <div><span>保险库</span><strong>{vaultUnlocked ? "已解锁" : "未解锁"}</strong></div>
-            <div><span>最近检测</span><strong>{formatDateTime(codexCliStatus?.checked_at)}</strong></div>
-          </div>
-        </section>
-
-        <section className="panel-card">
-          <div className="panel-head"><h3>快速操作</h3></div>
-          <label className="field-label">
-            目标账号
-            <select value={selectedAccountId} onChange={(event) => setSelectedAccountId(event.currentTarget.value)}>
-              {accounts.length === 0 && <option value="">暂无可选账号</option>}
-              {accounts.map((account) => (<option key={account.id} value={account.id}>{account.name}</option>))}
-            </select>
-          </label>
-          <p className="muted-text">当前选择：{selectedAccountName}</p>
-          <label className="checkbox-label">
-            <input type="checkbox" checked={forceRestart} onChange={(event) => setForceRestart(event.currentTarget.checked)} />
-            切换时强制重启 Codex 进程
-          </label>
-          <div className="button-row">
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={handleSwitchSelected}
-              disabled={!vaultUnlocked || !selectedAccountId || isActionLoading("switch-selected")}
-            >
-              {isActionLoading("switch-selected") ? "切换中..." : "一键切换"}
-            </button>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={handleRefreshSelectedQuota}
-              disabled={!vaultUnlocked || !selectedAccountId || isActionLoading("refresh-quota-selected")}
-            >
-              {isActionLoading("refresh-quota-selected") ? "刷新中..." : "刷新所选配额"}
-            </button>
-          </div>
-        </section>
-
-        <section className="panel-card panel-grow">
-          <div className="panel-head"><h3>活动时间线</h3></div>
-          {activityItems.length === 0 ? (
-            <div className="empty-block">暂无关键事件，执行登录、切换或刷新后会显示记录。</div>
-          ) : (
-            <div className="activity-list">
-              {activityItems.map((item) => (
-                <article className="activity-item" key={item.id}>
-                  <div className="activity-title-row">
-                    <span className={`activity-level ${item.level}`}>{item.level.toUpperCase()}</span>
-                    <strong>{item.title}</strong>
-                  </div>
-                  <p>{item.detail}</p>
-                  <small>{formatDateTime(item.created_at)}</small>
-                </article>
-              ))}
-            </div>
-          )}
-        </section>
-      </aside>
 
       {loadingPage && <div className="loading-mask">正在加载页面数据...</div>}
     </div>
