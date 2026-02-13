@@ -179,6 +179,14 @@
   - Why：避免“代码已更新但安装包仍是旧版”的发布错位，便于你直接分发与回溯。
   - Impact：`package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`
 
+- **[2026-02-13] 认证导入口径切换为“CLIProxy codex 顶层结构”**：导入/校验仅接受 `type=codex` 且顶层存在 `access_token` 的 JSON，不再依赖 `auth_mode/tokens.*` 嵌套字段。
+  - Why：修复导入 CLIProxy 导出文件被误判失效的问题，并对齐上游文件结构。
+  - Impact：`src-tauri/src/codex.rs`、`src-tauri/src/lib.rs`、`src-tauri/src/quota.rs`
+
+- **[2026-02-13] 通知策略收敛为“仅页面内提示”**：移除系统通知插件与“监控通知”右侧活动栏，改为主工作区内统一提示。
+  - Why：减少无效信息密度，提升界面简洁度并降低维护复杂度。
+  - Impact：`src/App.tsx`、`src/App.css`、`package.json`、`src-tauri/Cargo.toml`、`src-tauri/capabilities/default.json`
+
 ### Commands
 
 - `npm run tauri dev`：本地开发启动
@@ -209,6 +217,8 @@
   - Impact：`src/App.tsx`、`src/App.css`、`src/types.ts`
 - **[2026-02-12] 版本升级与打包产物更新**：当前发布版本提升至 `0.1.2`，并已生成对应 MSI/NSIS 安装包。
   - Impact：`package.json`、`package-lock.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`
+- **[2026-02-13] 当前状态**：CLIProxy 导入失效问题已修复，监控通知板块已移除，双栏简洁 UI 已落地并通过构建检查。
+  - Verify：`npm run build`、`cd src-tauri && cargo check`、`cd src-tauri && cargo test codex::tests`
 
 ### Known Issues
 
@@ -218,3 +228,5 @@
   - Verify：点击“登录并添加”并观察是否成功打开登录流程。
 - **[2026-02-12] Windows 登录探测仍依赖本机安装位置可发现**：若 npm 全局目录与常见 vendor 路径均不可达，将回退失败并输出探测摘要。
   - Verify：点击“登录并添加”，若失败检查错误信息中的“已尝试路径”是否符合预期。
+- **[2026-02-13] 导入校验已严格切换至 CLIProxy 格式**：旧版 `auth_mode/tokens.*` 嵌套结构将被拒绝导入，需先转换为 `type=codex` 顶层结构。
+  - Verify：导入旧格式样本应返回字段级错误；导入 CLIProxy codex 样本应成功入库。
