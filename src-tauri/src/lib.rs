@@ -34,17 +34,31 @@ fn ensure_name(name: &str, auth_json: &Value) -> String {
     if !name.trim().is_empty() {
         return name.trim().to_string();
     }
-    auth_json
-        .pointer("/tokens/account_id")
+    if let Some(email) = auth_json
+        .get("email")
         .and_then(Value::as_str)
-        .map(|id| {
-            if id.len() > 8 {
-                format!("账户-{}", &id[id.len() - 8..])
-            } else {
-                format!("账户-{id}")
-            }
-        })
-        .unwrap_or_else(|| "未命名账户".to_string())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return email.to_string();
+    }
+
+    if let Some(account_id) = auth_json
+        .get("account_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return account_id.to_string();
+    }
+
+    let suffix = compute_fingerprint(auth_json)
+        .ok()
+        .and_then(|fingerprint| fingerprint.split(':').nth(1).map(|hash| hash.to_string()))
+        .map(|hash| hash.chars().take(4).collect::<String>())
+        .filter(|hash| hash.len() == 4)
+        .unwrap_or_else(|| "0000".to_string());
+    format!("未命名账号-{suffix}")
 }
 
 fn unique_tags(tags: Vec<String>) -> Vec<String> {
@@ -469,7 +483,7 @@ async fn refresh_quota(
                 let auth_json: Value = serde_json::from_str(&auth_text)?;
                 let access_token = ensure_access_token(&auth_json)?;
                 let chatgpt_account_id = auth_json
-                    .pointer("/tokens/account_id")
+                    .get("account_id")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
@@ -612,7 +626,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             init_vault,

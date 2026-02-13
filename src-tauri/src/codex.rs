@@ -58,38 +58,65 @@ pub fn read_and_validate_auth_json(path: &Path) -> Result<Value> {
 }
 
 pub fn validate_auth_json(text: &str) -> Result<Value> {
-    let value: Value = serde_json::from_str(text).context("登录文件 JSON 解析失败")?;
-    let _auth_mode = value
-        .get("auth_mode")
+    let value: Value = serde_json::from_str(text).context("认证文件 JSON 解析失败")?;
+    let auth_type = value
+        .get("type")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("登录文件缺少 auth_mode 字段"))?;
-    let _account_id = value
-        .pointer("/tokens/account_id")
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .ok_or_else(|| anyhow!("认证文件缺少 type 字段"))?;
+    if !auth_type.eq_ignore_ascii_case("codex") {
+        return Err(anyhow!("认证文件 type 字段必须为 codex"));
+    }
+
+    value
+        .get("access_token")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("登录文件缺少 tokens.account_id 字段"))?;
-    let _access_token = value
-        .pointer("/tokens/access_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("登录文件缺少 tokens.access_token 字段"))?;
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .ok_or_else(|| anyhow!("认证文件缺少 access_token 字段"))?;
+
     Ok(value)
 }
 
 pub fn compute_fingerprint(value: &Value) -> Result<String> {
-    let auth_mode = value
-        .get("auth_mode")
+    let (prefix, raw_seed) = if let Some(account_id) = value
+        .get("account_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("无法读取 auth_mode"))?;
-    let account_id = value
-        .pointer("/tokens/account_id")
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+    {
+        ("account", account_id)
+    } else if let Some(email) = value
+        .get("email")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("无法读取 account_id"))?;
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+    {
+        ("email", email)
+    } else if let Some(access_token) = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+    {
+        ("token", access_token)
+    } else {
+        return Err(anyhow!(
+            "无法生成账号指纹：缺少 account_id、email 或 access_token 字段"
+        ));
+    };
+
+    let normalized_seed = if prefix == "email" {
+        raw_seed.to_lowercase()
+    } else {
+        raw_seed.to_string()
+    };
+
     let mut hasher = Sha256::new();
-    hasher.update(format!("{auth_mode}:{account_id}"));
+    hasher.update(format!("{prefix}:{normalized_seed}"));
     let digest = hasher.finalize();
-    Ok(format!(
-        "{account_id}:{}",
-        hex::encode(digest)[..16].to_string()
-    ))
+    Ok(format!("{prefix}:{}", &hex::encode(digest)[..16]))
 }
 
 pub fn atomic_write(path: &Path, content: &str) -> Result<()> {
@@ -521,7 +548,11 @@ fn is_web_login_unsupported(message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_codex_cli_process_fields, is_web_login_unsupported};
+    use super::{
+        compute_fingerprint, is_codex_cli_process_fields, is_web_login_unsupported,
+        validate_auth_json,
+    };
+    use serde_json::json;
 
     #[test]
     fn detects_real_codex_cli_process() {
@@ -565,5 +596,76 @@ mod tests {
         assert!(is_web_login_unsupported(
             "error: unexpected argument '--web' found"
         ));
+    }
+
+    #[test]
+    fn validates_codex_auth_json() {
+        let text = r#"{
+            "type": "  CoDeX  ",
+            "access_token": "token-123",
+            "account_id": "acc-1"
+        }"#;
+        assert!(validate_auth_json(text).is_ok());
+    }
+
+    #[test]
+    fn rejects_auth_json_without_type() {
+        let text = r#"{
+            "access_token": "token-123",
+            "account_id": "acc-1"
+        }"#;
+        let error = validate_auth_json(text).unwrap_err().to_string();
+        assert!(error.contains("type"));
+    }
+
+    #[test]
+    fn rejects_non_codex_type() {
+        let text = r#"{
+            "type": "chatgpt",
+            "access_token": "token-123",
+            "account_id": "acc-1"
+        }"#;
+        let error = validate_auth_json(text).unwrap_err().to_string();
+        assert!(error.contains("codex"));
+    }
+
+    #[test]
+    fn rejects_auth_json_without_access_token() {
+        let text = r#"{
+            "type": "codex",
+            "account_id": "acc-1"
+        }"#;
+        let error = validate_auth_json(text).unwrap_err().to_string();
+        assert!(error.contains("access_token"));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_distinct() {
+        let auth_a = json!({
+            "type": "codex",
+            "access_token": "token-a",
+            "account_id": "account-a",
+            "email": "alice@example.com"
+        });
+        let auth_a_copy = json!({
+            "type": "codex",
+            "access_token": "token-a",
+            "account_id": "account-a",
+            "email": "alice@example.com"
+        });
+        let auth_b = json!({
+            "type": "codex",
+            "access_token": "token-b",
+            "account_id": "account-b",
+            "email": "bob@example.com"
+        });
+
+        let fp_a = compute_fingerprint(&auth_a).expect("应生成指纹");
+        let fp_a_copy = compute_fingerprint(&auth_a_copy).expect("应生成指纹");
+        let fp_b = compute_fingerprint(&auth_b).expect("应生成指纹");
+
+        assert_eq!(fp_a, fp_a_copy);
+        assert_ne!(fp_a, fp_b);
+        assert!(fp_a.starts_with("account:"));
     }
 }

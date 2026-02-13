@@ -595,10 +595,12 @@ fn state_from_value(value: f64) -> &'static str {
 
 pub fn ensure_access_token(auth_json: &Value) -> Result<String> {
     auth_json
-        .pointer("/tokens/access_token")
+        .get("access_token")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .ok_or_else(|| anyhow!("该账号缺少 access_token，无法查询配额"))
+        .ok_or_else(|| anyhow!("该账号缺少 access_token 字段，无法查询配额"))
 }
 
 #[cfg(test)]
